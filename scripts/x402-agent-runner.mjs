@@ -1,0 +1,797 @@
+#!/usr/bin/env node
+
+import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+export const DEFAULT_SITE_URL = 'https://anchora.markets';
+export const DEFAULT_PAY_TO = 'DtWRumAEkL4AHfSwphuHf2RTmC2zJ9qP2wmGjtq4FxLP';
+export const DEFAULT_USDC_MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
+export const MAINNET_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+export const DEFAULT_X402_NETWORK = 'solana-devnet';
+export const DEFAULT_MAX_ATOMIC_AMOUNT = '300000';
+export const DEFAULT_POLICY = 'collateral_screening';
+export const PAYMENT_IDENTIFIER = 'payment-identifier';
+
+const ROUTES = new Set(['catalog', 'proof-package', 'investor-report', 'score', 'verify', 'by-mint']);
+const LOCAL_SIGNER_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+class AgentRunnerError extends Error {
+  constructor(message, details = undefined) {
+    super(message);
+    this.name = 'AgentRunnerError';
+    this.details = details;
+  }
+}
+
+export function parseArgv(argv) {
+  const args = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) continue;
+
+    const raw = token.slice(2);
+    const equalsIndex = raw.indexOf('=');
+    if (equalsIndex !== -1) {
+      args[raw.slice(0, equalsIndex)] = raw.slice(equalsIndex + 1);
+      continue;
+    }
+
+    const next = argv[index + 1];
+    if (!next || next.startsWith('--')) {
+      args[raw] = true;
+      continue;
+    }
+
+    args[raw] = next;
+    index += 1;
+  }
+
+  return args;
+}
+
+export function loadEnvFile(envPath, targetEnv = process.env) {
+  if (!envPath || !existsSync(envPath)) return false;
+
+  const raw = readFileSync(envPath, 'utf8');
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+
+    const [, key, rawValue] = match;
+    if (targetEnv[key] !== undefined) continue;
+
+    let value = rawValue.trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    targetEnv[key] = value.replace(/\\n/g, '\n');
+  }
+
+  return true;
+}
+
+export function normalizeX402Network(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (normalized === 'solana-devnet') return 'solana-devnet';
+  if (
+    normalized === 'solana' ||
+    normalized === 'solana-mainnet' ||
+    normalized === 'solana-mainnet-beta'
+  ) {
+    return 'solana';
+  }
+  return null;
+}
+
+function inferExpectedNetwork({ explicitNetwork, usdcMint }) {
+  const explicit = normalizeX402Network(explicitNetwork);
+  if (explicit) return explicit;
+  if (usdcMint === DEFAULT_USDC_MINT) return 'solana-devnet';
+  if (usdcMint === MAINNET_USDC_MINT) return 'solana';
+  return DEFAULT_X402_NETWORK;
+}
+
+export function buildConfig(argv = process.argv.slice(2), env = process.env) {
+  const args = parseArgv(argv);
+  const envFile = String(args['env-file'] ?? env.ANCHORA_X402_ENV_FILE ?? '.anchora/x402-signer.env');
+
+  if (!args['no-env-file']) {
+    loadEnvFile(resolve(envFile), env);
+  }
+
+  const route = String(args.route ?? env.ANCHORA_X402_ROUTE ?? 'proof-package');
+  if (!ROUTES.has(route)) {
+    throw new AgentRunnerError(`Unsupported route "${route}". Expected one of: ${[...ROUTES].join(', ')}`);
+  }
+  const defaultMaxAtomicAmount = route === 'investor-report' ? '1000000' : DEFAULT_MAX_ATOMIC_AMOUNT;
+
+  const signerUrl = optionalString(args['signer-url'] ?? env.ANCHORA_X402_SIGNER_URL);
+  const agentWallet = optionalString(args['agent-wallet'] ?? env.ANCHORA_X402_AGENT_WALLET);
+  let signerCommand = optionalString(args['signer-cmd'] ?? env.ANCHORA_X402_SIGNER_CMD);
+  if (agentWallet && !signerCommand && !signerUrl) {
+    signerCommand = JSON.stringify([
+      process.execPath,
+      resolve('scripts/x402-agent-wallet.mjs'),
+      'sign-x402',
+      '--wallet',
+      agentWallet,
+    ]);
+  }
+
+  const expectedUsdcMint = String(
+    args['usdc-mint'] ??
+      env.ANCHORA_X402_USDC_MINT ??
+      env.X402_SOLANA_USDC_MINT ??
+      DEFAULT_USDC_MINT
+  );
+
+  return {
+    route,
+    siteUrl: normalizeSiteUrl(String(args['site-url'] ?? env.ANCHORA_X402_SITE_URL ?? DEFAULT_SITE_URL)),
+    assetAddress: optionalString(args['asset-address'] ?? env.ANCHORA_X402_ASSET_ADDRESS),
+    mint: optionalString(args.mint ?? env.ANCHORA_X402_MINT),
+    txSignature: optionalString(args['tx-signature'] ?? env.ANCHORA_X402_TX_SIGNATURE),
+    policy: String(args.policy ?? env.ANCHORA_X402_POLICY ?? DEFAULT_POLICY),
+    expectedPayTo: String(args['pay-to'] ?? env.ANCHORA_X402_PAY_TO ?? env.X402_SOLANA_PAY_TO ?? DEFAULT_PAY_TO),
+    expectedUsdcMint,
+    expectedNetwork: inferExpectedNetwork({
+      explicitNetwork: args.network ?? env.ANCHORA_X402_NETWORK ?? env.X402_SOLANA_NETWORK,
+      usdcMint: expectedUsdcMint,
+    }),
+    maxAtomicAmount: String(
+      args['max-atomic-amount'] ?? env.ANCHORA_X402_MAX_ATOMIC_AMOUNT ?? defaultMaxAtomicAmount
+    ),
+    signerUrl,
+    signerToken: optionalString(args['signer-token'] ?? env.ANCHORA_X402_SIGNER_TOKEN),
+    signerCommand,
+    agentWallet,
+    allowHttpSigner:
+      args['allow-http-signer'] === true ||
+      env.ANCHORA_X402_ALLOW_HTTP_SIGNER === 'true',
+    executePayment:
+      args['execute-payment'] === true ||
+      env.ANCHORA_X402_EXECUTE_PAYMENT === 'true',
+    printBody:
+      args['print-body'] === true ||
+      env.ANCHORA_X402_PRINT_BODY === 'true',
+    timeoutMs: positiveInteger(args.timeout ?? env.ANCHORA_X402_TIMEOUT_MS, 30_000),
+  };
+}
+
+export function buildTargetUrl(config) {
+  const baseUrl = config.siteUrl.replace(/\/$/, '');
+
+  if (config.route === 'catalog') {
+    return `${baseUrl}/api/x402/v1/catalog`;
+  }
+
+  if (config.route === 'proof-package') {
+    requireField(config.assetAddress, 'ANCHORA_X402_ASSET_ADDRESS or --asset-address');
+    const url = new URL(`${baseUrl}/api/x402/v1/assets/${encodeURIComponent(config.assetAddress)}/proof-package`);
+    url.searchParams.set('policy', config.policy);
+    return url.href;
+  }
+
+  if (config.route === 'investor-report') {
+    requireField(config.assetAddress, 'ANCHORA_X402_ASSET_ADDRESS or --asset-address');
+    return `${baseUrl}/api/x402/v1/assets/${encodeURIComponent(config.assetAddress)}/investor-report`;
+  }
+
+  if (config.route === 'score') {
+    requireField(config.assetAddress, 'ANCHORA_X402_ASSET_ADDRESS or --asset-address');
+    return `${baseUrl}/api/x402/v1/assets/${encodeURIComponent(config.assetAddress)}/score`;
+  }
+
+  if (config.route === 'verify') {
+    requireField(config.txSignature, 'ANCHORA_X402_TX_SIGNATURE or --tx-signature');
+    return `${baseUrl}/api/x402/v1/verify/${encodeURIComponent(config.txSignature)}`;
+  }
+
+  requireField(config.mint, 'ANCHORA_X402_MINT or --mint');
+  return `${baseUrl}/api/x402/v1/assets/by-mint/${encodeURIComponent(config.mint)}`;
+}
+
+export function buildCatalogUrl(config) {
+  return `${config.siteUrl.replace(/\/$/, '')}/api/x402/v1/catalog`;
+}
+
+export function buildPaymentIdentifier(now = new Date(), randomBytes = crypto.randomBytes(12)) {
+  const date = now.toISOString().slice(0, 10).replace(/-/g, '');
+  return `anchora_${date}_${Buffer.from(randomBytes).toString('hex')}`;
+}
+
+export function selectPaymentRequirement(quoteBody) {
+  const accepts = Array.isArray(quoteBody?.accepts) ? quoteBody.accepts : [];
+  const requirements = Array.isArray(quoteBody?.paymentRequirements)
+    ? quoteBody.paymentRequirements
+    : [];
+  const candidates = [...accepts, ...requirements];
+  return candidates.find(candidate => candidate?.scheme === 'exact' && normalizeX402Network(candidate?.network)) ?? null;
+}
+
+export function validatePaymentRequirement(requirement, options) {
+  const errors = [];
+  const expectedUrl = new URL(options.expectedUrl);
+  let resourceUrl = null;
+
+  if (!requirement || typeof requirement !== 'object') {
+    return { ok: false, errors: ['payment requirement is missing or invalid'] };
+  }
+
+  const expectedNetwork = normalizeX402Network(options.expectedNetwork ?? DEFAULT_X402_NETWORK);
+  const requirementNetwork = normalizeX402Network(requirement.network);
+
+  if (requirement.scheme !== 'exact') errors.push('scheme must be exact');
+  if (!requirementNetwork) errors.push('network must be a supported Solana x402 network');
+  else if (requirementNetwork !== expectedNetwork) errors.push(`network must be ${expectedNetwork}`);
+  if (requirement.asset !== options.expectedUsdcMint) {
+    errors.push(`asset must be ${options.expectedUsdcMint}`);
+  }
+  if (requirement.payTo !== options.expectedPayTo) {
+    errors.push(`payTo must be ${options.expectedPayTo}`);
+  }
+
+  try {
+    resourceUrl = new URL(String(requirement.resource));
+  } catch {
+    errors.push('resource must be a valid URL');
+  }
+
+  if (resourceUrl) {
+    if (resourceUrl.href !== expectedUrl.href) {
+      errors.push(`resource must exactly match ${expectedUrl.href}`);
+    }
+    if (resourceUrl.host !== expectedUrl.host) {
+      errors.push(`resource host must be ${expectedUrl.host}`);
+    }
+    if (!resourceUrl.pathname.startsWith('/api/x402/v1/')) {
+      errors.push('resource path must be under /api/x402/v1/');
+    }
+    if (resourceUrl.protocol !== 'https:' && !LOCAL_SIGNER_HOSTS.has(resourceUrl.hostname)) {
+      errors.push('resource must use https outside localhost');
+    }
+  }
+
+  const amountRaw = String(requirement.maxAmountRequired ?? '');
+  const maxRaw = String(options.maxAtomicAmount ?? '');
+  if (!/^\d+$/.test(amountRaw)) {
+    errors.push('maxAmountRequired must be an integer string');
+  }
+  if (!/^\d+$/.test(maxRaw)) {
+    errors.push('maxAtomicAmount must be an integer string');
+  }
+  if (/^\d+$/.test(amountRaw) && /^\d+$/.test(maxRaw)) {
+    const amount = BigInt(amountRaw);
+    const max = BigInt(maxRaw);
+    if (amount <= 0n) errors.push('maxAmountRequired must be positive');
+    if (amount > max) errors.push(`maxAmountRequired ${amount} exceeds cap ${max}`);
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+export function buildSignerRequest({ config, quoteBody, requirement, targetUrl, paymentIdentifier }) {
+  return {
+    type: 'x402.sign',
+    x402Version: Number(quoteBody?.x402Version ?? 1),
+    paymentRequirements: requirement,
+    extensions: {
+      [PAYMENT_IDENTIFIER]: {
+        info: {
+          required: false,
+          id: paymentIdentifier,
+        },
+      },
+    },
+    context: {
+      provider: 'anchora',
+      siteUrl: config.siteUrl,
+      targetUrl,
+      route: config.route,
+      assetAddress: config.assetAddress ?? null,
+      mint: config.mint ?? null,
+      txSignature: config.txSignature ?? null,
+      policy: config.route === 'proof-package' ? config.policy : null,
+      expected: {
+        scheme: 'exact',
+        network: config.expectedNetwork,
+        asset: config.expectedUsdcMint,
+        payTo: config.expectedPayTo,
+        maxAtomicAmount: config.maxAtomicAmount,
+      },
+    },
+  };
+}
+
+export function resolveSignerUrl(rawUrl, allowHttpSigner = false) {
+  if (!rawUrl) throw new AgentRunnerError('ANCHORA_X402_SIGNER_URL or --signer-url is required');
+
+  const url = new URL(rawUrl);
+  if ((url.pathname === '' || url.pathname === '/') && !url.search) {
+    url.pathname = '/v1/x402/sign';
+  }
+
+  const isLocalHttp = url.protocol === 'http:' && LOCAL_SIGNER_HOSTS.has(url.hostname);
+  if (url.protocol !== 'https:' && !isLocalHttp && !allowHttpSigner) {
+    throw new AgentRunnerError('Signer URL must use https outside localhost');
+  }
+
+  return url.href;
+}
+
+export async function callHttpSigner({ signerUrl, signerToken, allowHttpSigner, payload, timeoutMs }) {
+  if (!signerToken) {
+    throw new AgentRunnerError('ANCHORA_X402_SIGNER_TOKEN or --signer-token is required for HTTP signer mode');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(resolveSignerUrl(signerUrl, allowHttpSigner), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${signerToken}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    const body = await readJsonOrText(response);
+    if (!response.ok) {
+      throw new AgentRunnerError(`Signer returned HTTP ${response.status}`, summarizeErrorBody(body));
+    }
+    return body;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function callCommandSigner({ signerCommand, payload, timeoutMs }) {
+  if (!signerCommand) {
+    throw new AgentRunnerError('ANCHORA_X402_SIGNER_CMD or --signer-cmd is required for command signer mode');
+  }
+
+  const [command, ...args] = parseCommand(signerCommand);
+  if (!command) throw new AgentRunnerError('Signer command is empty');
+
+  const child = spawn(command, args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    shell: false,
+  });
+
+  let stdout = '';
+  let stderr = '';
+  const timeout = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
+
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    stdout += chunk;
+  });
+  child.stderr.on('data', chunk => {
+    stderr += chunk;
+  });
+
+  child.stdin.end(`${JSON.stringify(payload)}\n`);
+
+  const exitCode = await new Promise((resolveExit, rejectExit) => {
+    child.on('error', rejectExit);
+    child.on('close', resolveExit);
+  });
+  clearTimeout(timeout);
+
+  if (exitCode !== 0) {
+    throw new AgentRunnerError(`Signer command failed with exit code ${exitCode}`, {
+      signerError: summarizeSignerError(stderr || stdout),
+    });
+  }
+
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new AgentRunnerError('Signer command did not return JSON');
+  }
+}
+
+export function normalizeSignerResponse(responseBody, expectedPaymentIdentifier) {
+  const xPayment =
+    responseBody?.xPayment ??
+    responseBody?.paymentHeader ??
+    responseBody?.payment ??
+    null;
+
+  if (typeof xPayment !== 'string' || !xPayment.trim()) {
+    throw new AgentRunnerError('Signer response must include xPayment or paymentHeader');
+  }
+
+  const decoded = decodePaymentHeader(xPayment);
+  if (!decoded.ok) {
+    throw new AgentRunnerError('Signer returned an X-PAYMENT value that is not base64 JSON');
+  }
+
+  const payloadId = extractPaymentIdentifier(decoded.value);
+  const responseId = responseBody?.paymentIdentifier;
+  if (payloadId !== expectedPaymentIdentifier) {
+    throw new AgentRunnerError('Signer response did not include the expected payment-identifier');
+  }
+  if (responseId !== undefined && responseId !== expectedPaymentIdentifier) {
+    throw new AgentRunnerError('Signer response paymentIdentifier does not match the request');
+  }
+
+  return {
+    xPayment,
+    payerAddress: typeof responseBody?.payerAddress === 'string' ? responseBody.payerAddress : null,
+  };
+}
+
+export async function runAgentPayment(config) {
+  const targetUrl = buildTargetUrl(config);
+
+  if (config.route === 'catalog') {
+    const { catalogBody, catalogResponse } = await fetchCatalog(config);
+
+    return {
+      ok: true,
+      dryRun: false,
+      paymentRequired: false,
+      status: catalogResponse.status,
+      targetUrl,
+      route: config.route,
+      body: config.printBody ? catalogBody : summarizeCatalog(catalogBody),
+    };
+  }
+
+  const { catalogBody } = await fetchCatalog(config);
+  assertSettlementReady(catalogBody);
+
+  const quoteResponse = await fetch(targetUrl);
+  const quoteBody = await readJsonOrText(quoteResponse);
+
+  if (quoteResponse.status !== 402) {
+    throw new AgentRunnerError(`Expected unpaid request to return 402, got ${quoteResponse.status}`, {
+      targetUrl,
+      body: summarizeBody(quoteBody),
+    });
+  }
+
+  const requirement = selectPaymentRequirement(quoteBody);
+  if (!requirement) {
+    throw new AgentRunnerError('No Solana exact payment requirement found in 402 quote');
+  }
+
+  const validation = validatePaymentRequirement(requirement, {
+    expectedUrl: targetUrl,
+    expectedPayTo: config.expectedPayTo,
+    expectedUsdcMint: config.expectedUsdcMint,
+    expectedNetwork: config.expectedNetwork,
+    maxAtomicAmount: config.maxAtomicAmount,
+  });
+  if (!validation.ok) {
+    throw new AgentRunnerError('Payment requirement failed local policy checks', validation.errors);
+  }
+
+  const paymentIdentifier = buildPaymentIdentifier();
+  const quoteSummary = {
+    targetUrl,
+    route: config.route,
+    policy: config.route === 'proof-package' ? config.policy : null,
+    paymentIdentifier,
+    requirement: {
+      scheme: requirement.scheme,
+      network: requirement.network,
+      asset: requirement.asset,
+      payTo: requirement.payTo,
+      maxAmountRequired: requirement.maxAmountRequired,
+      resource: requirement.resource,
+      maxTimeoutSeconds: requirement.maxTimeoutSeconds,
+    },
+  };
+
+  if (!config.executePayment) {
+    return {
+      ok: true,
+      dryRun: true,
+      quoteValidated: true,
+      paymentRequired: true,
+      requiresExecutionGrant: true,
+      message: 'Quote validated. Re-run with --execute-payment or ANCHORA_X402_EXECUTE_PAYMENT=true to ask the configured signer to pay.',
+      ...quoteSummary,
+    };
+  }
+
+  const signerPayload = buildSignerRequest({
+    config,
+    quoteBody,
+    requirement,
+    targetUrl,
+    paymentIdentifier,
+  });
+
+  const signerResponse = config.signerCommand
+    ? await callCommandSigner({
+        signerCommand: config.signerCommand,
+        payload: signerPayload,
+        timeoutMs: config.timeoutMs,
+      })
+    : await callHttpSigner({
+        signerUrl: config.signerUrl,
+        signerToken: config.signerToken,
+        allowHttpSigner: config.allowHttpSigner,
+        payload: signerPayload,
+        timeoutMs: config.timeoutMs,
+      });
+
+  const { xPayment, payerAddress } = normalizeSignerResponse(signerResponse, paymentIdentifier);
+  const paidResponse = await fetch(targetUrl, {
+    headers: { 'X-PAYMENT': xPayment },
+  });
+  const paidBody = await readJsonOrText(paidResponse);
+  const paymentResponseHeader = paidResponse.headers.get('x-payment-response');
+  const paymentResponse = parsePaymentResponseHeader(paymentResponseHeader);
+
+  return {
+    ok: paidResponse.ok,
+    dryRun: false,
+    status: paidResponse.status,
+    targetUrl,
+    route: config.route,
+    policy: config.route === 'proof-package' ? config.policy : null,
+    payerAddress,
+    paymentIdentifier,
+    paymentResponse,
+    body: config.printBody ? paidBody : summarizeBody(paidBody),
+  };
+}
+
+async function readJsonOrText(response) {
+  const text = await response.text();
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function parsePaymentResponseHeader(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { raw: value };
+  }
+}
+
+function decodePaymentHeader(paymentHeader) {
+  try {
+    return {
+      ok: true,
+      value: JSON.parse(Buffer.from(paymentHeader, 'base64').toString('utf8')),
+    };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function extractPaymentIdentifier(paymentPayload) {
+  return paymentPayload?.extensions?.[PAYMENT_IDENTIFIER]?.info?.id ?? null;
+}
+
+function summarizeBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+
+  return {
+    assetId: body.asset?.assetId ?? body.asset_id ?? body.assetId ?? null,
+    score:
+      body.score?.score ??
+      body.score ??
+      body.confidence_score ??
+      body.currentScore ??
+      null,
+    underwritingPolicy: body.underwritingPolicy?.profile ?? null,
+    automationReadiness: body.decisionSummary?.automationReadiness ?? null,
+    recommendedAction: body.decisionSummary?.recommendedAction ?? null,
+    signatureStatus: body.integrity?.signature?.status ?? null,
+    error: body.error ?? null,
+    keys: Object.keys(body).slice(0, 20),
+  };
+}
+
+function summarizeCatalog(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+
+  return {
+    name: body.name ?? null,
+    x402Version: body.x402Version ?? null,
+    baseUrl: body.baseUrl ?? null,
+    settlement: body.settlement
+      ? {
+          scheme: body.settlement.scheme ?? null,
+          network: body.settlement.network ?? null,
+          asset: body.settlement.asset ?? null,
+          payTo: body.settlement.payTo ?? null,
+          mode: body.settlement.mode ?? null,
+          ready: body.settlement.ready ?? null,
+          detail: body.settlement.detail ?? null,
+          facilitatorUrl: body.settlement.facilitatorUrl ?? null,
+        }
+      : null,
+    idempotency: body.idempotency
+      ? {
+          extension: body.idempotency.extension ?? null,
+          required: body.idempotency.required ?? null,
+          ttlSeconds: body.idempotency.ttlSeconds ?? null,
+        }
+      : null,
+    routes: Array.isArray(body.routes)
+      ? body.routes.map(route => ({
+          routeId: route.routeId ?? null,
+          method: route.method ?? null,
+          pathTemplate: route.pathTemplate ?? route.path ?? null,
+          priceUsd: route.priceUsd ?? null,
+          description: route.description ?? null,
+        }))
+      : [],
+  };
+}
+
+async function fetchCatalog(config) {
+  const catalogUrl = buildCatalogUrl(config);
+  const catalogResponse = await fetch(catalogUrl);
+  const catalogBody = await readJsonOrText(catalogResponse);
+  if (!catalogResponse.ok) {
+    throw new AgentRunnerError(`Catalog request returned HTTP ${catalogResponse.status}`, {
+      targetUrl: catalogUrl,
+      body: summarizeErrorBody(catalogBody),
+    });
+  }
+
+  return { catalogUrl, catalogBody, catalogResponse };
+}
+
+function assertSettlementReady(catalogBody) {
+  const settlement = catalogBody?.settlement;
+  if (settlement?.ready !== true) {
+    throw new AgentRunnerError('Anchora x402 settlement is not ready', {
+      settlement: settlement
+        ? {
+            mode: settlement.mode ?? null,
+            ready: settlement.ready ?? null,
+            detail: settlement.detail ?? null,
+            facilitatorUrl: settlement.facilitatorUrl ?? null,
+          }
+        : null,
+    });
+  }
+}
+
+function summarizeErrorBody(body) {
+  if (!body) return null;
+  if (typeof body === 'string') return body.slice(0, 500);
+  return summarizeBody(body);
+}
+
+function summarizeSignerError(output) {
+  if (!output) return null;
+  const trimmed = String(output).trim();
+  if (!trimmed) return null;
+
+  try {
+    return sanitizeSignerError(JSON.parse(trimmed));
+  } catch {
+    return sanitizeSignerError(trimmed);
+  }
+}
+
+function sanitizeSignerError(value, key = '', depth = 0) {
+  if (depth > 5) return '[truncated]';
+  if (/secret|private|seed|token|authorization|xpayment|paymentheader|transaction/i.test(key)) {
+    return '[redacted]';
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map(item => sanitizeSignerError(item, key, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).slice(0, 20).map(([entryKey, entryValue]) => [
+        entryKey,
+        sanitizeSignerError(entryValue, entryKey, depth + 1),
+      ])
+    );
+  }
+  if (typeof value === 'string') return value.slice(0, 500);
+  return value;
+}
+
+function parseCommand(command) {
+  const trimmed = command.trim();
+  if (trimmed.startsWith('[')) {
+    const parsed = JSON.parse(trimmed);
+    if (!Array.isArray(parsed) || parsed.some(part => typeof part !== 'string')) {
+      throw new AgentRunnerError('JSON signer command must be an array of strings');
+    }
+    return parsed;
+  }
+  return trimmed.split(/\s+/);
+}
+
+function normalizeSiteUrl(value) {
+  const url = new URL(value);
+  return url.origin;
+}
+
+function optionalString(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return String(value);
+}
+
+function requireField(value, label) {
+  if (!value) throw new AgentRunnerError(`${label} is required`);
+}
+
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function printHelp() {
+  console.log(`Anchora x402 agent runner
+
+Usage:
+  npm run x402:agent -- --route catalog
+  npm run x402:agent -- --asset-address <asset_pda> [--policy collateral_screening]
+  npm run x402:agent -- --route investor-report --asset-address <asset_pda>
+  npm run x402:agent -- --asset-address <asset_pda> --execute-payment
+
+Environment:
+  ANCHORA_X402_SIGNER_URL       HTTPS signer endpoint; /v1/x402/sign is appended for bare origins
+  ANCHORA_X402_SIGNER_TOKEN     Bearer token for the signer endpoint
+  ANCHORA_X402_SIGNER_CMD       Local signer command; receives JSON on stdin and returns JSON on stdout
+  ANCHORA_X402_AGENT_WALLET     Local .anchora agent wallet name; uses scripts/x402-agent-wallet.mjs
+  ANCHORA_X402_ASSET_ADDRESS    Asset contract/PDA address for score/proof-package/investor-report routes
+  ANCHORA_X402_EXECUTE_PAYMENT  Set true to execute a real signer-backed payment
+
+By default the runner validates the 402 quote and stops before payment.
+Use --route catalog for free discovery before choosing a paid route.`);
+}
+
+async function main() {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    printHelp();
+    return;
+  }
+
+  try {
+    const config = buildConfig();
+    const result = await runAgentPayment(config);
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok && !result.dryRun) process.exitCode = 1;
+  } catch (error) {
+    const body = {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      details: error instanceof AgentRunnerError ? error.details : undefined,
+    };
+    console.error(JSON.stringify(body, null, 2));
+    process.exitCode = 1;
+  }
+}
+
+const entryPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
+if (entryPath && import.meta.url === entryPath) {
+  await main();
+}

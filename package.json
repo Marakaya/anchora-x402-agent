@@ -1,0 +1,22 @@
+{
+  "name": "@anchora/x402-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Anchora x402 agent helper for Solana USDC pay-per-call proof packages.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "x402:agent": "node scripts/x402-agent-runner.mjs",
+    "x402:wallet": "node scripts/x402-agent-wallet.mjs",
+    "catalog": "node scripts/x402-agent-runner.mjs --route catalog",
+    "pay.sh:proof": "npx -y @solana/pay --verbose curl https://anchora.markets/api/x402/v1/assets/2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX/proof-package",
+    "test": "node --test tests/scripts/*.test.mjs",
+    "check": "node --check scripts/x402-agent-runner.mjs && node --check scripts/x402-agent-wallet.mjs && npm test"
+  },
+  "dependencies": {
+    "@solana/kit": "^6.8.0"
+  }
+}
