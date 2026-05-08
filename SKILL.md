@@ -35,6 +35,8 @@ The runnable helper commands live in the public helper repo:
 https://github.com/Marakaya/anchora-x402-agent
 ```
 
+Use this public helper repo as the canonical command workspace. Do not require access to the private Anchora app repository for x402 setup, wallet creation, quote validation, or payment retries.
+
 If the current workspace is not that repo:
 
 1. Obtain the public helper repo as a local command workspace. Git is optional:

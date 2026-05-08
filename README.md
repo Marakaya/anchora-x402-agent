@@ -4,6 +4,8 @@ Standalone helper for AI agents that need to buy Anchora RWA trust data through 
 
 This repository is intentionally public and minimal. It contains only the agent payment helper, local bounded-wallet signer, installable skill instructions, public defaults, and tests. It does not contain Anchora app source code, judge passwords, API keys, seed phrases, private keypairs, or production secrets.
 
+Use this repository as the canonical command workspace for agent-side x402 testing. Agents and judges do not need access to the private Anchora app repository.
+
 ## What This Does
 
 - Reads the free Anchora x402 catalog.
