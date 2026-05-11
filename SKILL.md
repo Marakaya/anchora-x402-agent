@@ -7,6 +7,10 @@ description: Use when an agent needs to fetch Anchora RWA score, proof-package, 
 
 Anchora sells machine-readable trust for real-world assets. Use the x402 rail when the user wants an autonomous agent to pay per request in Solana USDC and return verified asset data.
 
+## Version Guard
+
+Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.3.0` or newer. Older copies may fetch the protected route directly for quote discovery, which can be slow or fail in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first.
+
 Current production-facing settlement is server-side and declared in `/api/x402/v1/catalog`. Anchora may use Coinbase CDP or `direct-solana` proof mode. The agent does not need a Coinbase account and does not call a facilitator directly: it checks `settlement.ready`, calls Anchora, receives a 402 quote, signs a Solana USDC payment through a bounded signer, retries Anchora with `X-PAYMENT`, and Anchora verifies/settles server-side.
 
 For hackathon or judge testing, use devnet only. Mainnet x402 settlement has a historical proof transaction, but public hands-on testing should fund only devnet SOL and devnet test USDC declared by `/catalog`.

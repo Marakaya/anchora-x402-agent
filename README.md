@@ -6,6 +6,18 @@ This repository is intentionally public and minimal. It contains only the agent 
 
 Use this repository as the canonical command workspace for agent-side x402 testing. Agents and judges do not need access to the private Anchora app repository.
 
+## Version Guard
+
+Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.3.0` or newer:
+
+```bash
+git pull --ff-only
+npm ci
+node -p "require('./package.json').version"
+```
+
+Older copies may fetch the protected route directly for quote discovery, which can be slow or fail in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first.
+
 ## What This Does
 
 - Reads the free Anchora x402 catalog.
