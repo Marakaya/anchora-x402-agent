@@ -127,7 +127,10 @@ npm run x402:agent -- \
 npm run x402:wallet -- context-plan --wallet default < signer-request.json
 ```
 
-4. Fetch every `fetchWithBridge[].url` through the bridge and build `solana-context.json`.
+4. Prefer `fetchContextWithBridge.url` from the wallet context-plan output. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
+
+If the one-call URL is unavailable, fetch every `fetchWithBridge[].url` instead and fetch `latestBlockhash` last, immediately before signing.
+
 5. Sign locally:
 
 ```bash
@@ -143,6 +146,8 @@ npm run x402:agent -- \
 6. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header.
 
 Do not pay through the bridge wallet. The bridge should never receive the local wallet secret.
+
+Do not run a separate facilitator pre-verify in restricted bridge mode. It can make the blockhash expire before the paid retry. If the paid retry reports `BlockhashNotFound`, refresh `solana-context.json`, sign once more, and retry immediately.
 
 ## Installable Skill
 

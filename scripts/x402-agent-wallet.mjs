@@ -755,8 +755,12 @@ export async function buildContextPlan(walletRecord, request, rpcProxyUrl = DEFA
     ok: true,
     walletAddress: walletRecord.address,
     rpcProxyUrl,
+    fetchContextWithBridge: {
+      key: 'solanaContext',
+      url: proxyUrl(rpcProxyUrl, { method: 'signing-context', payer: walletRecord.address }),
+      note: 'Preferred restricted-network path: fetch this one URL through the HTTP bridge immediately before offline-sign and save the response as solana-context.json.',
+    },
     fetchWithBridge: [
-      { key: 'latestBlockhash', url: proxyUrl(rpcProxyUrl, { method: 'latest-blockhash' }) },
       { key: `accounts.${requirement.asset}`, url: proxyUrl(rpcProxyUrl, { method: 'account', address: requirement.asset }) },
       {
         key: `accounts.${sourceTokenAta}`,
@@ -774,6 +778,7 @@ export async function buildContextPlan(walletRecord, request, rpcProxyUrl = DEFA
         key: `accounts.${destinationToken2022Ata}`,
         url: proxyUrl(rpcProxyUrl, { method: 'account', address: destinationToken2022Ata }),
       },
+      { key: 'latestBlockhash', url: proxyUrl(rpcProxyUrl, { method: 'latest-blockhash' }) },
     ],
     contextTemplate: {
       latestBlockhash: 'paste latestBlockhash response object here',

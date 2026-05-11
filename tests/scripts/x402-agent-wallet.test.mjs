@@ -187,7 +187,10 @@ test('buildContextPlan returns bridge-fetchable Solana RPC context URLs', async 
 
   assert.equal(plan.ok, true);
   assert.equal(plan.walletAddress, record.address);
-  assert.equal(plan.fetchWithBridge.some(item => item.key === 'latestBlockhash'), true);
+  assert.equal(plan.fetchContextWithBridge.key, 'solanaContext');
+  assert.equal(plan.fetchContextWithBridge.url.includes('method=signing-context'), true);
+  assert.equal(plan.fetchContextWithBridge.url.includes(`payer=${encodeURIComponent(record.address)}`), true);
+  assert.equal(plan.fetchWithBridge.at(-1).key, 'latestBlockhash');
   assert.equal(
     plan.fetchWithBridge.some(item => item.url.includes('method=account') && item.url.includes(DEFAULT_USDC_MINT)),
     true

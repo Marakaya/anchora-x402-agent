@@ -141,7 +141,9 @@ npm run x402:agent -- --offline-context-plan --quote-file quote.json --asset-add
 npm run x402:wallet -- context-plan --wallet default < signer-request.json
 ```
 
-6. Fetch every `fetchWithBridge[].url` through the bridge. Save `solana-context.json` as:
+6. Prefer the returned `fetchContextWithBridge.url`. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
+
+If your environment cannot use the one-call context URL, fetch every `fetchWithBridge[].url` through the bridge instead. Fetch `latestBlockhash` last, immediately before signing. Save `solana-context.json` as:
 
 ```json
 {
@@ -161,6 +163,8 @@ npm run x402:agent -- --offline-sign --quote-file quote.json --solana-context-fi
 8. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header.
 
 This keeps the dedicated Anchora wallet as payer. The bridge transports HTTP/RPC data only; it must not create or fund the payment.
+
+Do not run a separate facilitator pre-verify in restricted bridge mode. It can consume enough time for the blockhash to expire. If the paid retry reports `BlockhashNotFound`, refresh `solana-context.json`, re-run the offline signing command once, and retry immediately.
 
 ## Helper Runner
 
