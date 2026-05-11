@@ -318,6 +318,126 @@ test('runAgentPayment treats quote-only validation as a successful dry run', asy
   }
 });
 
+test('runAgentPayment checks payment status without x402 payment', async () => {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    assert.equal(
+      String(url),
+      'https://anchora.markets/api/x402/v1/payments/anchora_20260512_00112233445566778899aabb/status'
+    );
+    return new Response(
+      JSON.stringify({
+        paymentIdentifier: 'anchora_20260512_00112233445566778899aabb',
+        status: 'settled',
+        settlementTransaction: 'settlement-tx',
+        settledAt: '2026-05-12T10:00:00.000Z',
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    );
+  };
+
+  try {
+    const result = await runAgentPayment(baseConfig({
+      argv: ['--check-payment', 'anchora_20260512_00112233445566778899aabb'],
+    }));
+    assert.equal(result.ok, true);
+    assert.equal(result.paymentRequired, false);
+    assert.equal(result.body.status, 'settled');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('runAgentPayment retries once on structured pre-send blockhash expiry', async () => {
+  const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
+  const catalogUrl = 'https://anchora.markets/api/x402/v1/catalog';
+  const signerScript = `
+    let input = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { input += chunk; });
+    process.stdin.on('end', () => {
+      const request = JSON.parse(input);
+      const id = request.extensions['payment-identifier'].info.id;
+      const payload = {
+        extensions: { 'payment-identifier': { info: { required: false, id } } },
+        payload: { authorization: { from: 'payer' } }
+      };
+      process.stdout.write(JSON.stringify({
+        xPayment: Buffer.from(JSON.stringify(payload)).toString('base64'),
+        paymentIdentifier: id,
+        payerAddress: 'payer'
+      }));
+    });
+  `;
+  const previousFetch = globalThis.fetch;
+  const seen = [];
+
+  globalThis.fetch = async (url, init = {}) => {
+    seen.push({ url: String(url), hasPayment: Boolean(init.headers?.['X-PAYMENT']) });
+    if (String(url) === catalogUrl) {
+      return new Response(
+        JSON.stringify({
+          name: 'Anchora x402 Agent API',
+          settlement: { mode: 'direct-solana', ready: true, detail: 'ready' },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+
+    assert.equal(String(url), targetUrl);
+    if (!init.headers?.['X-PAYMENT']) {
+      return new Response(JSON.stringify({ x402Version: 1, accepts: [validRequirement(targetUrl)] }), {
+        status: 402,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    const paidAttempt = seen.filter(entry => entry.url === targetUrl && entry.hasPayment).length;
+    if (paidAttempt === 1) {
+      return new Response(
+        JSON.stringify({
+          error: 'blockhash_expired',
+          phase: 'verify',
+          retryable: true,
+          detail: 'Solana blockhash expired during pre-send verification',
+        }),
+        { status: 402, headers: { 'content-type': 'application/json' } }
+      );
+    }
+
+    return new Response(
+      JSON.stringify({ ok: true, asset: { assetId: 'A1' } }),
+      {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-payment-response': JSON.stringify({ success: true, transaction: 'settlement-tx' }),
+        },
+      }
+    );
+  };
+
+  try {
+    const result = await runAgentPayment(baseConfig({
+      argv: [
+        '--execute-payment',
+        '--signer-cmd',
+        JSON.stringify([process.execPath, '-e', signerScript]),
+      ],
+    }));
+    assert.equal(result.ok, true);
+    assert.equal(result.retries.length, 1);
+    assert.deepEqual(result.retries[0], {
+      reason: 'blockhash_expired',
+      phase: 'verify',
+      status: 402,
+    });
+    assert.equal(seen.filter(entry => entry.url === targetUrl && entry.hasPayment).length, 2);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 test('runOfflineAgentPayment builds a signer request from a saved quote without network fetches', async () => {
   const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
   const dir = mkdtempSync(join(tmpdir(), 'anchora-x402-offline-'));

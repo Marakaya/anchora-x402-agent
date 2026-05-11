@@ -86,22 +86,25 @@ Check balance:
 npm run x402:wallet -- balance --wallet default
 ```
 
-Validate the quote without payment:
-
-```bash
-npm run x402:agent -- \
-  --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX \
-  --agent-wallet default
-```
-
-Execute payment after the user has authorized the local policy:
+Preferred single-call payment command after the user has authorized the local policy:
 
 ```bash
 npm run x402:agent -- \
   --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX \
   --agent-wallet default \
   --execute-payment \
-  --print-body
+  --print-body \
+  --json
+```
+
+The helper validates the quote before signing. This single-call form avoids slow multi-step agent reasoning loops.
+
+Validate the quote without payment:
+
+```bash
+npm run x402:agent -- \
+  --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX \
+  --agent-wallet default
 ```
 
 The local wallet refuses wrong domain, wrong route prefix, wrong Solana x402 network, wrong USDC mint, wrong recipient, over-cap amount, over daily cap, and missing `payment-identifier`.
@@ -143,11 +146,15 @@ npm run x402:agent -- \
   --payment-identifier <same_payment_identifier>
 ```
 
-6. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header.
+6. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward the helper-produced header verbatim; do not parse, edit, or rebuild it.
 
 Do not pay through the bridge wallet. The bridge should never receive the local wallet secret.
 
-Do not run a separate facilitator pre-verify in restricted bridge mode. It can make the blockhash expire before the paid retry. If the paid retry reports `BlockhashNotFound`, refresh `solana-context.json`, sign once more, and retry immediately.
+Do not run a separate facilitator pre-verify in restricted bridge mode. It can make the blockhash expire before the paid retry. Retry only if Anchora returns a structured pre-send error such as `blockhash_expired` with `phase: "verify"` or `phase: "build"` and `retryable: true`. If Anchora returns `settlement_pending` with `checkTransaction`, do not re-sign or repay; check the status first:
+
+```bash
+npm run x402:agent -- --check-payment <payment_identifier>
+```
 
 ## Installable Skill
 

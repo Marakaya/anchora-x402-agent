@@ -117,10 +117,12 @@ npm run x402:wallet -- balance --wallet default
 Pay with that wallet:
 
 ```bash
-npm run x402:agent -- --asset-address <asset_pda> --agent-wallet default --execute-payment --print-body
+npm run x402:agent -- --asset-address <asset_pda> --agent-wallet default --execute-payment --print-body --json
 ```
 
 The wallet refuses quotes outside `https://anchora.markets/api/x402/v1/*`, wrong USDC mint, wrong recipient, over-cap amounts, over daily cap, or missing `payment-identifier`.
+
+Never parse the `402` challenge and assemble `X-PAYMENT` manually. The helper constructs the header. In bridge fallback mode, forward the helper-produced header verbatim exactly once; do not edit, mutate, or reuse it across attempts.
 
 ### No-direct-network fallback
 
@@ -160,11 +162,15 @@ If your environment cannot use the one-call context URL, fetch every `fetchWithB
 npm run x402:agent -- --offline-sign --quote-file quote.json --solana-context-file solana-context.json --asset-address <asset_pda> --agent-wallet default --payment-identifier <same_payment_identifier>
 ```
 
-8. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header.
+8. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward it verbatim; do not parse, edit, or rebuild it.
 
 This keeps the dedicated Anchora wallet as payer. The bridge transports HTTP/RPC data only; it must not create or fund the payment.
 
-Do not run a separate facilitator pre-verify in restricted bridge mode. It can consume enough time for the blockhash to expire. If the paid retry reports `BlockhashNotFound`, refresh `solana-context.json`, re-run the offline signing command once, and retry immediately.
+Do not run a separate facilitator pre-verify in restricted bridge mode. It can consume enough time for the blockhash to expire. Retry only when the paid retry returns a structured pre-send error such as `blockhash_expired` with `phase: "verify"` or `phase: "build"` and `retryable: true`. If the response is `settlement_pending` with `checkTransaction`, do not re-sign or repay; check server status first:
+
+```bash
+npm run x402:agent -- --check-payment <payment_identifier>
+```
 
 ## Helper Runner
 
@@ -173,12 +179,13 @@ When operating inside the public helper repo, prefer the bundled runner:
 ```bash
 npm run x402:agent -- --route catalog
 npm run x402:agent -- --asset-address <asset_pda>
+npm run x402:agent -- --check-payment <payment_identifier>
 ```
 
 The first command reads the free machine-readable catalog. The second validates the paid quote and stops before payment. To execute a real signer-backed payment after authorization:
 
 ```bash
-npm run x402:agent -- --asset-address <asset_pda> --agent-wallet default --execute-payment --print-body
+npm run x402:agent -- --asset-address <asset_pda> --agent-wallet default --execute-payment --print-body --json
 ```
 
 Useful environment:

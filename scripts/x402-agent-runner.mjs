@@ -170,6 +170,7 @@ export function buildConfig(argv = process.argv.slice(2), env = process.env) {
     offlineContextPlan:
       args['offline-context-plan'] === true ||
       env.ANCHORA_X402_OFFLINE_CONTEXT_PLAN === 'true',
+    checkPayment: optionalString(args['check-payment'] ?? env.ANCHORA_X402_CHECK_PAYMENT),
     quoteFile: optionalString(args['quote-file'] ?? env.ANCHORA_X402_QUOTE_FILE),
     solanaContextFile: optionalString(args['solana-context-file'] ?? env.ANCHORA_X402_SOLANA_CONTEXT_FILE),
     paymentIdentifier: optionalString(args['payment-identifier'] ?? env.ANCHORA_X402_PAYMENT_IDENTIFIER),
@@ -448,6 +449,10 @@ export function normalizeSignerResponse(responseBody, expectedPaymentIdentifier)
 }
 
 export async function runAgentPayment(config) {
+  if (config.checkPayment) {
+    return runPaymentStatusCheck(config);
+  }
+
   const targetUrl = buildTargetUrl(config);
 
   if (config.offlineSign || config.offlineContextPlan) {
@@ -526,47 +531,88 @@ export async function runAgentPayment(config) {
     };
   }
 
-  const signerPayload = buildSignerRequest({
-    config,
-    quoteBody,
-    requirement,
-    targetUrl,
-    paymentIdentifier,
-  });
+  const retries = [];
+  let lastResult = null;
 
-  const signerResponse = config.signerCommand
-    ? await callCommandSigner({
-        signerCommand: config.signerCommand,
-        payload: signerPayload,
-        timeoutMs: config.timeoutMs,
-      })
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const signerPayload = buildSignerRequest({
+      config,
+      quoteBody,
+      requirement,
+      targetUrl,
+      paymentIdentifier,
+    });
+
+    const signerResponse = config.signerCommand
+      ? await callCommandSigner({
+          signerCommand: config.signerCommand,
+          payload: signerPayload,
+          timeoutMs: config.timeoutMs,
+        })
       : await callHttpSigner({
-        signerUrl: config.signerUrl,
-        signerToken: config.signerToken,
-        allowHttpSigner: config.allowHttpSigner,
-        payload: signerPayload,
-        timeoutMs: config.timeoutMs,
+          signerUrl: config.signerUrl,
+          signerToken: config.signerToken,
+          allowHttpSigner: config.allowHttpSigner,
+          payload: signerPayload,
+          timeoutMs: config.timeoutMs,
+        });
+
+    const { xPayment, payerAddress } = normalizeSignerResponse(signerResponse, paymentIdentifier);
+    const paidResponse = await fetch(targetUrl, {
+      headers: { 'X-PAYMENT': xPayment },
+    });
+    const paidBody = await readJsonOrText(paidResponse);
+    const paymentResponseHeader = paidResponse.headers.get('x-payment-response');
+    const paymentResponse = parsePaymentResponseHeader(paymentResponseHeader);
+
+    lastResult = {
+      ok: paidResponse.ok,
+      dryRun: false,
+      status: paidResponse.status,
+      targetUrl,
+      route: config.route,
+      policy: config.route === 'proof-package' ? config.policy : null,
+      payerAddress,
+      paymentIdentifier,
+      paymentResponse,
+      retries,
+      body: config.printBody ? paidBody : summarizeBody(paidBody),
+    };
+
+    if (paidResponse.ok) return lastResult;
+
+    if (attempt === 0 && isSafePreSendRetry(paidBody)) {
+      retries.push({
+        reason: paidBody.error,
+        phase: paidBody.phase,
+        status: paidResponse.status,
       });
+      continue;
+    }
 
-  const { xPayment, payerAddress } = normalizeSignerResponse(signerResponse, paymentIdentifier);
-  const paidResponse = await fetch(targetUrl, {
-    headers: { 'X-PAYMENT': xPayment },
-  });
-  const paidBody = await readJsonOrText(paidResponse);
-  const paymentResponseHeader = paidResponse.headers.get('x-payment-response');
-  const paymentResponse = parsePaymentResponseHeader(paymentResponseHeader);
+    return lastResult;
+  }
 
+  return lastResult;
+}
+
+export async function runPaymentStatusCheck(config) {
+  const paymentIdentifier = String(config.checkPayment);
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(paymentIdentifier)) {
+    throw new AgentRunnerError('Invalid payment identifier for --check-payment');
+  }
+
+  const url = `${config.siteUrl.replace(/\/$/, '')}/api/x402/v1/payments/${encodeURIComponent(paymentIdentifier)}/status`;
+  const response = await fetch(url);
+  const body = await readJsonOrText(response);
   return {
-    ok: paidResponse.ok,
+    ok: response.ok,
     dryRun: false,
-    status: paidResponse.status,
-    targetUrl,
-    route: config.route,
-    policy: config.route === 'proof-package' ? config.policy : null,
-    payerAddress,
+    paymentRequired: false,
+    status: response.status,
+    targetUrl: url,
     paymentIdentifier,
-    paymentResponse,
-    body: config.printBody ? paidBody : summarizeBody(paidBody),
+    body,
   };
 }
 
@@ -653,7 +699,7 @@ export async function runOfflineAgentPayment(config, targetUrl = buildTargetUrl(
     payerAddress,
     paymentIdentifier,
     headers: { 'X-PAYMENT': xPayment },
-    next: 'Retry the exact targetUrl immediately with this X-PAYMENT header using the available HTTP bridge. If the server reports BlockhashNotFound, refresh solana-context.json and re-run offline-sign once.',
+    next: 'Retry the exact targetUrl immediately with this X-PAYMENT header using the available HTTP bridge. Forward the header verbatim. Retry signing only if Anchora returns blockhash_expired with phase build/verify and retryable true.',
   };
 }
 
@@ -718,8 +764,22 @@ function summarizeBody(body) {
     recommendedAction: body.decisionSummary?.recommendedAction ?? null,
     signatureStatus: body.integrity?.signature?.status ?? null,
     error: body.error ?? null,
+    phase: body.phase ?? null,
+    retryable: body.retryable ?? null,
+    detail: body.detail ?? null,
+    checkTransaction: body.checkTransaction ?? null,
     keys: Object.keys(body).slice(0, 20),
   };
+}
+
+function isSafePreSendRetry(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  return (
+    body.error === 'blockhash_expired' &&
+    body.retryable === true &&
+    (body.phase === 'build' || body.phase === 'verify') &&
+    !body.checkTransaction
+  );
 }
 
 function summarizeCatalog(body) {
@@ -867,6 +927,7 @@ Usage:
   npm run x402:agent -- --asset-address <asset_pda> [--policy collateral_screening]
   npm run x402:agent -- --route investor-report --asset-address <asset_pda>
   npm run x402:agent -- --asset-address <asset_pda> --execute-payment
+  npm run x402:agent -- --check-payment <payment_identifier>
 
 Environment:
   ANCHORA_X402_SIGNER_URL       HTTPS signer endpoint; /v1/x402/sign is appended for bare origins
@@ -878,6 +939,7 @@ Environment:
   ANCHORA_X402_OFFLINE_SIGN     Sign from a saved 402 quote/context without local network fetches
   ANCHORA_X402_OFFLINE_CONTEXT_PLAN
                                   Build a restricted-network signer request and bridge context plan
+  ANCHORA_X402_CHECK_PAYMENT     Read payment status by payment-identifier without x402
   ANCHORA_X402_QUOTE_FILE       Saved 402 JSON quote used by offline signing
 
 By default the runner validates the 402 quote and stops before payment.
