@@ -214,7 +214,7 @@ Do not run a separate facilitator pre-verify in restricted bridge mode. It can m
 npm run x402:agent -- --check-payment <payment_identifier>
 ```
 
-Facilitator-settle technical failures intentionally return structured non-402 responses (`409` for retryable `blockhash_expired`, `502` for pending or failed settlement) so x402-aware bridges expose the body instead of treating it as a new payment challenge.
+Facilitator-settle technical failures intentionally return structured `409` responses for retryable, pending, or failed settlement states so x402-aware bridges expose the body instead of treating it as a new payment challenge.
 
 ## Installable Skill
 

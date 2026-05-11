@@ -229,7 +229,7 @@ Then sign locally with the dedicated Anchora wallet. Do not try the protected UR
 
 Do not pay with the bridge wallet. The protected URL recognizes the pre-settled facilitator attempt and caches the response without submitting the Solana transaction a second time.
 
-Facilitator-settle technical failures intentionally do not use HTTP `402`; they return structured `409` or `502` JSON so x402-aware bridges do not swallow the body. If you still see `402 Payment Required but no recognized protocol` from facilitator-settle, refresh the helper/skill first.
+Facilitator-settle technical failures intentionally do not use HTTP `402`; they return structured `409` JSON so x402-aware bridges do not swallow the body. If you still see `402 Payment Required but no recognized protocol` from facilitator-settle, refresh the helper/skill first.
 
 ## Helper Runner
 
