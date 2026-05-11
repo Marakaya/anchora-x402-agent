@@ -215,6 +215,48 @@ export function buildCatalogUrl(config) {
   return `${config.siteUrl.replace(/\/$/, '')}/api/x402/v1/catalog`;
 }
 
+export function buildQuoteUrl(config) {
+  if (config.route === 'catalog') {
+    throw new AgentRunnerError('Catalog route does not have a paid quote URL');
+  }
+
+  const url = new URL(`${config.siteUrl.replace(/\/$/, '')}/api/x402/v1/quote`);
+
+  if (config.route === 'proof-package') {
+    requireField(config.assetAddress, 'ANCHORA_X402_ASSET_ADDRESS or --asset-address');
+    url.searchParams.set('route', 'proof-package');
+    url.searchParams.set('asset_address', config.assetAddress);
+    url.searchParams.set('policy', config.policy);
+    return url.href;
+  }
+
+  if (config.route === 'investor-report') {
+    requireField(config.assetAddress, 'ANCHORA_X402_ASSET_ADDRESS or --asset-address');
+    url.searchParams.set('route', 'investor-report');
+    url.searchParams.set('asset_address', config.assetAddress);
+    return url.href;
+  }
+
+  if (config.route === 'score') {
+    requireField(config.assetAddress, 'ANCHORA_X402_ASSET_ADDRESS or --asset-address');
+    url.searchParams.set('route', 'score');
+    url.searchParams.set('asset_address', config.assetAddress);
+    return url.href;
+  }
+
+  if (config.route === 'verify') {
+    requireField(config.txSignature, 'ANCHORA_X402_TX_SIGNATURE or --tx-signature');
+    url.searchParams.set('route', 'verify');
+    url.searchParams.set('tx_signature', config.txSignature);
+    return url.href;
+  }
+
+  requireField(config.mint, 'ANCHORA_X402_MINT or --mint');
+  url.searchParams.set('route', 'by-mint');
+  url.searchParams.set('mint', config.mint);
+  return url.href;
+}
+
 export function buildPaymentIdentifier(now = new Date(), randomBytes = crypto.randomBytes(12)) {
   const date = now.toISOString().slice(0, 10).replace(/-/g, '');
   return `anchora_${date}_${Buffer.from(randomBytes).toString('hex')}`;
@@ -476,19 +518,11 @@ export async function runAgentPayment(config) {
   const { catalogBody } = await fetchCatalog(config);
   assertSettlementReady(catalogBody);
 
-  const quoteResponse = await fetch(targetUrl);
-  const quoteBody = await readJsonOrText(quoteResponse);
-
-  if (quoteResponse.status !== 402) {
-    throw new AgentRunnerError(`Expected unpaid request to return 402, got ${quoteResponse.status}`, {
-      targetUrl,
-      body: summarizeBody(quoteBody),
-    });
-  }
+  const { quoteBody, quoteSource } = await fetchQuote(config, targetUrl);
 
   const requirement = selectPaymentRequirement(quoteBody);
   if (!requirement) {
-    throw new AgentRunnerError('No Solana exact payment requirement found in 402 quote');
+    throw new AgentRunnerError('No Solana exact payment requirement found in x402 quote');
   }
 
   const validation = validatePaymentRequirement(requirement, {
@@ -506,6 +540,7 @@ export async function runAgentPayment(config) {
   const quoteSummary = {
     targetUrl,
     route: config.route,
+    quoteSource,
     policy: config.route === 'proof-package' ? config.policy : null,
     paymentIdentifier,
     requirement: {
@@ -594,6 +629,35 @@ export async function runAgentPayment(config) {
   }
 
   return lastResult;
+}
+
+async function fetchQuote(config, targetUrl) {
+  const quoteUrl = buildQuoteUrl(config);
+  const quoteResponse = await fetch(quoteUrl);
+  const quoteBody = await readJsonOrText(quoteResponse);
+
+  if (quoteResponse.ok) {
+    return { quoteBody, quoteSource: 'quote-endpoint', quoteUrl };
+  }
+
+  if (quoteResponse.status !== 404 && quoteResponse.status !== 405) {
+    throw new AgentRunnerError(`Quote endpoint returned HTTP ${quoteResponse.status}`, {
+      quoteUrl,
+      body: summarizeErrorBody(quoteBody),
+    });
+  }
+
+  const challengeResponse = await fetch(targetUrl);
+  const challengeBody = await readJsonOrText(challengeResponse);
+
+  if (challengeResponse.status !== 402) {
+    throw new AgentRunnerError(`Expected unpaid request to return 402, got ${challengeResponse.status}`, {
+      targetUrl,
+      body: summarizeBody(challengeBody),
+    });
+  }
+
+  return { quoteBody: challengeBody, quoteSource: 'http-402', quoteUrl: targetUrl };
 }
 
 export async function runPaymentStatusCheck(config) {
@@ -943,7 +1007,8 @@ Environment:
   ANCHORA_X402_QUOTE_FILE       Saved 402 JSON quote used by offline signing
 
 By default the runner validates the 402 quote and stops before payment.
-Use --route catalog for free discovery before choosing a paid route.`);
+Use --route catalog for free discovery before choosing a paid route.
+Paid-route quote discovery uses /api/x402/v1/quote first, then falls back to HTTP 402 if needed.`);
 }
 
 async function main() {

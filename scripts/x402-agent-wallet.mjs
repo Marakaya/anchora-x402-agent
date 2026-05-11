@@ -6,6 +6,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -13,6 +14,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -965,6 +967,7 @@ function printHelp() {
 
 Usage:
   npm run x402:wallet -- create --wallet default
+  npm run x402:wallet -- create --wallet default --wallet-dir "$TMPDIR/anchora-agent-wallets"
   npm run x402:wallet -- info --wallet default
   npm run x402:wallet -- balance --wallet default
   npm run x402:wallet -- sign-x402 --wallet default
@@ -978,6 +981,32 @@ Create defaults:
 
 The sign-x402 command reads a signer request JSON from stdin and returns JSON on stdout.
 It never prints the wallet secret key.`);
+}
+
+function isWritableLocationError(error) {
+  return (
+    error?.code === 'EPERM' ||
+    error?.code === 'EACCES' ||
+    error?.code === 'EROFS'
+  );
+}
+
+function saveWalletRecordWithFallback(record, walletDir, args) {
+  try {
+    const path = saveWalletRecord(record, walletDir);
+    return { path, walletDir, fallback: false };
+  } catch (error) {
+    if (args['wallet-dir'] || !isWritableLocationError(error)) throw error;
+
+    const fallbackDir = mkdtempSync(join(tmpdir(), 'anchora-agent-wallets-'));
+    const path = saveWalletRecord(record, fallbackDir);
+    return {
+      path,
+      walletDir: fallbackDir,
+      fallback: true,
+      originalError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 async function runCreate(args) {
@@ -1003,11 +1032,22 @@ async function runCreate(args) {
     network: args.network ?? process.env.ANCHORA_X402_NETWORK ?? process.env.X402_SOLANA_NETWORK,
     simulateBeforeSign: args['no-simulate'] !== true,
   });
-  saveWalletRecord(record, walletDir);
+  const saved = saveWalletRecordWithFallback(record, walletDir, args);
 
   return {
     ok: true,
     created: true,
+    path: saved.path,
+    walletDir: saved.walletDir,
+    ...(saved.fallback
+      ? {
+          fallback: {
+            reason: 'default wallet directory was not writable',
+            originalError: saved.originalError,
+            useWalletDirFlag: `--wallet-dir ${saved.walletDir}`,
+          },
+        }
+      : {}),
     wallet: formatWalletInfo(record),
     funding: {
       sendTo: record.address,

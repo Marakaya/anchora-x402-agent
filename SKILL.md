@@ -61,6 +61,7 @@ If shell access or a local Node/npm runtime is unavailable, tell the user the cu
 Base URL: `https://anchora.markets/api/x402/v1`
 
 - Catalog: `GET /catalog` (free)
+- Quote: `GET /quote?route=proof-package&asset_address={asset_address}&policy=collateral_screening` (free, returns payment requirements as `200 JSON`)
 - Proof package: `GET /assets/{asset_address}/proof-package?policy=collateral_screening`
 - Score: `GET /assets/{asset_address}/score`
 - By mint: `GET /assets/by-mint/{mint}`
@@ -102,6 +103,13 @@ Create the wallet:
 npm run x402:wallet -- create --wallet default --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
 ```
 
+If `.anchora/agent-wallets` is not writable, choose a writable temp directory and reuse it on later wallet commands:
+
+```bash
+wallet_dir="$(mktemp -d)"
+npm run x402:wallet -- create --wallet default --wallet-dir "$wallet_dir" --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
+```
+
 Tell the user to fund the printed public key with:
 
 ```text
@@ -129,21 +137,28 @@ Never parse the `402` challenge and assemble `X-PAYMENT` manually. The helper co
 If the shell can run Node and access the local wallet file but cannot resolve `anchora.markets` or `api.devnet.solana.com`, do not switch to a bridge payment wallet. Use the agent's HTTP bridge only as transport:
 
 1. Fetch `/catalog` through the bridge.
-2. Fetch the target route without `X-PAYMENT` through the bridge and save the `402` JSON body as `quote.json`.
-3. Build an offline context plan:
+2. Fetch `/quote` through the bridge and save the `200` JSON body as `quote.json`. Example:
+
+```text
+GET https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_address=<asset_pda>&policy=collateral_screening
+```
+
+3. If `/quote` works, do not fetch the protected route without `X-PAYMENT`. Some bridges intercept HTTP `402` and swallow the quote body.
+4. If `/quote` is unavailable, fetch the protected route without `X-PAYMENT` through a transparent HTTP client only, then save the `402` JSON body as `quote.json`.
+5. Build an offline context plan:
 
 ```bash
 npm run x402:agent -- --offline-context-plan --quote-file quote.json --asset-address <asset_pda> --agent-wallet default
 ```
 
-4. Save the returned `signerRequest` as `signer-request.json`.
-5. Run:
+6. Save the returned `signerRequest` as `signer-request.json`.
+7. Run:
 
 ```bash
 npm run x402:wallet -- context-plan --wallet default < signer-request.json
 ```
 
-6. Prefer the returned `fetchContextWithBridge.url`. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
+8. Prefer the returned `fetchContextWithBridge.url`. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
 
 If your environment cannot use the one-call context URL, fetch every `fetchWithBridge[].url` through the bridge instead. Fetch `latestBlockhash` last, immediately before signing. Save `solana-context.json` as:
 
@@ -156,13 +171,13 @@ If your environment cannot use the one-call context URL, fetch every `fetchWithB
 }
 ```
 
-7. Sign locally with the same `paymentIdentifier` from step 3:
+9. Sign locally with the same `paymentIdentifier` from the offline context plan:
 
 ```bash
 npm run x402:agent -- --offline-sign --quote-file quote.json --solana-context-file solana-context.json --asset-address <asset_pda> --agent-wallet default --payment-identifier <same_payment_identifier>
 ```
 
-8. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward it verbatim; do not parse, edit, or rebuild it.
+10. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward it verbatim; do not parse, edit, or rebuild it.
 
 This keeps the dedicated Anchora wallet as payer. The bridge transports HTTP/RPC data only; it must not create or fund the payment.
 
@@ -171,6 +186,16 @@ Do not run a separate facilitator pre-verify in restricted bridge mode. It can c
 ```bash
 npm run x402:agent -- --check-payment <payment_identifier>
 ```
+
+### Bridge intercepts HTTP 402
+
+Some agent runtimes and payment bridges treat HTTP `402` as a protocol-level signal and may try to pay it from a bridge wallet. If you see `402 Payment Required but no recognized protocol`, use `/quote` for discovery instead of trying to read the protected-route challenge:
+
+```text
+GET /api/x402/v1/quote?route=proof-package&asset_address=<asset_pda>&policy=collateral_screening
+```
+
+Then sign locally with the dedicated Anchora wallet and retry the protected route with the helper-produced `X-PAYMENT` header. Do not pay with the bridge wallet.
 
 ## Helper Runner
 
@@ -205,8 +230,8 @@ If available, read `docs/runbooks/x402-agent-signer.md` for the full signer cont
 
 1. Fetch `/catalog` for available routes, prices, and settlement status.
 2. Stop if `settlement.ready` is not `true`; report `settlement.detail`.
-3. Call the target route without `X-PAYMENT`.
-4. Expect HTTP `402` with `accepts[0]`.
+3. Prefer `GET /quote?...` to receive `accepts[0]` as `200 JSON`.
+4. If `/quote` is unavailable and your HTTP client is transparent to `402`, call the target route without `X-PAYMENT`.
 5. Validate quote against the payment policy, including the live catalog `network`.
 6. Generate a fresh `payment-identifier` extension id.
 7. Ask the signer to create an `X-PAYMENT` header.

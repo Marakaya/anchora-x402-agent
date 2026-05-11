@@ -9,6 +9,7 @@ import {
   DEFAULT_USDC_MINT,
   buildConfig,
   buildPaymentIdentifier,
+  buildQuoteUrl,
   buildSignerRequest,
   buildTargetUrl,
   callCommandSigner,
@@ -60,6 +61,15 @@ test('buildTargetUrl uses asset contract address and policy query for proof-pack
   assert.equal(
     buildTargetUrl(config),
     `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=insurance_review`
+  );
+});
+
+test('buildQuoteUrl returns a 200-JSON quote endpoint URL for bridge-safe discovery', () => {
+  const config = baseConfig({ argv: ['--policy', 'insurance_review'] });
+
+  assert.equal(
+    buildQuoteUrl(config),
+    `https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_address=${ASSET_ADDRESS}&policy=insurance_review`
   );
 });
 
@@ -283,6 +293,7 @@ test('runAgentPayment fetches the free catalog without a signer', async () => {
 test('runAgentPayment treats quote-only validation as a successful dry run', async () => {
   const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
   const catalogUrl = 'https://anchora.markets/api/x402/v1/catalog';
+  const quoteUrl = `https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_address=${ASSET_ADDRESS}&policy=collateral_screening`;
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async url => {
     if (String(url) === catalogUrl) {
@@ -299,9 +310,9 @@ test('runAgentPayment treats quote-only validation as a successful dry run', asy
       );
     }
 
-    assert.equal(String(url), targetUrl);
+    assert.equal(String(url), quoteUrl);
     return new Response(JSON.stringify({ x402Version: 1, accepts: [validRequirement(targetUrl)] }), {
-      status: 402,
+      status: 200,
       headers: { 'content-type': 'application/json' },
     });
   };
@@ -312,7 +323,51 @@ test('runAgentPayment treats quote-only validation as a successful dry run', asy
     assert.equal(result.dryRun, true);
     assert.equal(result.quoteValidated, true);
     assert.equal(result.paymentRequired, true);
+    assert.equal(result.quoteSource, 'quote-endpoint');
     assert.equal(result.requirement.payTo, DEFAULT_PAY_TO);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('runAgentPayment falls back to HTTP 402 quote when quote endpoint is unavailable', async () => {
+  const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
+  const catalogUrl = 'https://anchora.markets/api/x402/v1/catalog';
+  const quoteUrl = `https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_address=${ASSET_ADDRESS}&policy=collateral_screening`;
+  const previousFetch = globalThis.fetch;
+  const seen = [];
+
+  globalThis.fetch = async url => {
+    seen.push(String(url));
+    if (String(url) === catalogUrl) {
+      return new Response(
+        JSON.stringify({
+          name: 'Anchora x402 Agent API',
+          settlement: { mode: 'direct-solana', ready: true, detail: 'ready' },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+
+    if (String(url) === quoteUrl) {
+      return new Response(JSON.stringify({ error: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    assert.equal(String(url), targetUrl);
+    return new Response(JSON.stringify({ x402Version: 1, accepts: [validRequirement(targetUrl)] }), {
+      status: 402,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const result = await runAgentPayment(baseConfig());
+    assert.equal(result.ok, true);
+    assert.equal(result.quoteSource, 'http-402');
+    assert.deepEqual(seen, [catalogUrl, quoteUrl, targetUrl]);
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -351,6 +406,7 @@ test('runAgentPayment checks payment status without x402 payment', async () => {
 test('runAgentPayment retries once on structured pre-send blockhash expiry', async () => {
   const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
   const catalogUrl = 'https://anchora.markets/api/x402/v1/catalog';
+  const quoteUrl = `https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_address=${ASSET_ADDRESS}&policy=collateral_screening`;
   const signerScript = `
     let input = '';
     process.stdin.setEncoding('utf8');
@@ -382,6 +438,13 @@ test('runAgentPayment retries once on structured pre-send blockhash expiry', asy
         }),
         { status: 200, headers: { 'content-type': 'application/json' } }
       );
+    }
+
+    if (String(url) === quoteUrl) {
+      return new Response(JSON.stringify({ x402Version: 1, accepts: [validRequirement(targetUrl)] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
     }
 
     assert.equal(String(url), targetUrl);
