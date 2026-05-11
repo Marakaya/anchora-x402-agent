@@ -215,6 +215,14 @@ export function buildCatalogUrl(config) {
   return `${config.siteUrl.replace(/\/$/, '')}/api/x402/v1/catalog`;
 }
 
+export function buildFacilitatorSettleUrl(config) {
+  return `${config.siteUrl.replace(/\/$/, '')}/api/x402/facilitator/settle`;
+}
+
+export function buildPaymentStatusUrl(config, paymentIdentifier) {
+  return `${config.siteUrl.replace(/\/$/, '')}/api/x402/v1/payments/${encodeURIComponent(paymentIdentifier)}/status`;
+}
+
 export function buildQuoteUrl(config) {
   if (config.route === 'catalog') {
     throw new AgentRunnerError('Catalog route does not have a paid quote URL');
@@ -490,6 +498,18 @@ export function normalizeSignerResponse(responseBody, expectedPaymentIdentifier)
   };
 }
 
+export function buildFacilitatorSettleRequest(xPayment, requirement) {
+  const decoded = decodePaymentHeader(xPayment);
+  if (!decoded.ok) {
+    throw new AgentRunnerError('Cannot build facilitator settle request from invalid X-PAYMENT');
+  }
+
+  return {
+    paymentPayload: decoded.value,
+    paymentRequirements: requirement,
+  };
+}
+
 export async function runAgentPayment(config) {
   if (config.checkPayment) {
     return runPaymentStatusCheck(config);
@@ -666,7 +686,7 @@ export async function runPaymentStatusCheck(config) {
     throw new AgentRunnerError('Invalid payment identifier for --check-payment');
   }
 
-  const url = `${config.siteUrl.replace(/\/$/, '')}/api/x402/v1/payments/${encodeURIComponent(paymentIdentifier)}/status`;
+  const url = buildPaymentStatusUrl(config, paymentIdentifier);
   const response = await fetch(url);
   const body = await readJsonOrText(response);
   return {
@@ -732,7 +752,8 @@ export async function runOfflineAgentPayment(config, targetUrl = buildTargetUrl(
         'Run: npm run x402:wallet -- context-plan --wallet <wallet> < signer-request.json',
         'Prefer the returned fetchContextWithBridge.url; fetch it once through the HTTP bridge immediately before signing and save the response as solana-context.json.',
         'If using the fallback fetchWithBridge list, fetch latestBlockhash last.',
-        'Run offline signing with --offline-sign --quote-file <quote.json> --solana-context-file <context.json>, then retry the target URL immediately with X-PAYMENT.',
+        'Run offline signing with --offline-sign --quote-file <quote.json> --solana-context-file <context.json>.',
+        'If your HTTP bridge intercepts 402, POST the returned facilitatorSettle.body to facilitatorSettle.url before redeeming the target URL with X-PAYMENT.',
       ],
     };
   }
@@ -752,6 +773,7 @@ export async function runOfflineAgentPayment(config, targetUrl = buildTargetUrl(
       });
 
   const { xPayment, payerAddress } = normalizeSignerResponse(signerResponse, paymentIdentifier);
+  const facilitatorSettleBody = buildFacilitatorSettleRequest(xPayment, requirement);
 
   return {
     ok: true,
@@ -763,7 +785,21 @@ export async function runOfflineAgentPayment(config, targetUrl = buildTargetUrl(
     payerAddress,
     paymentIdentifier,
     headers: { 'X-PAYMENT': xPayment },
-    next: 'Retry the exact targetUrl immediately with this X-PAYMENT header using the available HTTP bridge. Forward the header verbatim. Retry signing only if Anchora returns blockhash_expired with phase build/verify and retryable true.',
+    facilitatorSettle: {
+      url: buildFacilitatorSettleUrl(config),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: facilitatorSettleBody,
+    },
+    paymentStatus: {
+      url: buildPaymentStatusUrl(config, paymentIdentifier),
+      method: 'GET',
+    },
+    next: [
+      'Transparent HTTP client: retry targetUrl immediately with the X-PAYMENT header.',
+      'Bridge that intercepts 402: POST facilitatorSettle.body to facilitatorSettle.url first, then GET paymentStatus.url until status is settled, then GET targetUrl with the same X-PAYMENT header to redeem the response.',
+      'Retry signing only if Anchora reports blockhash_expired with phase build/verify and retryable true before send.',
+    ],
   };
 }
 

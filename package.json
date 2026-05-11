@@ -1,6 +1,6 @@
 {
   "name": "@anchora/x402-agent",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Standalone Anchora x402 agent helper for Solana USDC pay-per-call proof packages.",

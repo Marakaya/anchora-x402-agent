@@ -9,9 +9,9 @@ Anchora sells machine-readable trust for real-world assets. Use the x402 rail wh
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.3.0` or newer. Older copies may fetch the protected route directly for quote discovery, which can be slow or fail in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first.
+Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.4.0` or newer. Older copies may fetch the protected route directly or try to redeem before settlement in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first and includes a bridge-safe facilitator-settle path.
 
-Current production-facing settlement is server-side and declared in `/api/x402/v1/catalog`. Anchora may use Coinbase CDP or `direct-solana` proof mode. The agent does not need a Coinbase account and does not call a facilitator directly: it checks `settlement.ready`, calls Anchora, receives a 402 quote, signs a Solana USDC payment through a bounded signer, retries Anchora with `X-PAYMENT`, and Anchora verifies/settles server-side.
+Current production-facing settlement is server-side and declared in `/api/x402/v1/catalog`. Anchora may use Coinbase CDP or `direct-solana` proof mode. In a transparent HTTP client, the agent checks `settlement.ready`, calls Anchora, receives a quote, signs a Solana USDC payment through a bounded signer, retries Anchora with `X-PAYMENT`, and Anchora verifies/settles server-side. In a bridge that intercepts HTTP `402`, the agent uses the helper's returned `facilitatorSettle` body first, then redeems the same target URL with the same `X-PAYMENT`.
 
 For hackathon or judge testing, use devnet only. Mainnet x402 settlement has a historical proof transaction, but public hands-on testing should fund only devnet SOL and devnet test USDC declared by `/catalog`.
 
@@ -181,11 +181,12 @@ If your environment cannot use the one-call context URL, fetch every `fetchWithB
 npm run x402:agent -- --offline-sign --quote-file quote.json --solana-context-file solana-context.json --asset-address <asset_pda> --agent-wallet default --payment-identifier <same_payment_identifier>
 ```
 
-10. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward it verbatim; do not parse, edit, or rebuild it.
+10. If your bridge is transparent to `402`, retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward it verbatim; do not parse, edit, or rebuild it.
+11. If your bridge intercepts `402`, POST the helper's returned `facilitatorSettle.body` to `facilitatorSettle.url`, then check `paymentStatus.url` until `status: "settled"`, then GET the target URL with the same `X-PAYMENT` header to redeem the response.
 
 This keeps the dedicated Anchora wallet as payer. The bridge transports HTTP/RPC data only; it must not create or fund the payment.
 
-Do not run a separate facilitator pre-verify in restricted bridge mode. It can consume enough time for the blockhash to expire. Retry only when the paid retry returns a structured pre-send error such as `blockhash_expired` with `phase: "verify"` or `phase: "build"` and `retryable: true`. If the response is `settlement_pending` with `checkTransaction`, do not re-sign or repay; check server status first:
+Do not run a separate facilitator pre-verify in restricted bridge mode. It can consume enough time for the blockhash to expire. Retry only when facilitator-settle or the paid retry returns a structured pre-send error such as `blockhash_expired` with `phase: "verify"` or `phase: "build"` and `retryable: true`. If the response is `settlement_pending` with `checkTransaction`, do not re-sign or repay; check server status first:
 
 ```bash
 npm run x402:agent -- --check-payment <payment_identifier>
@@ -199,7 +200,13 @@ Some agent runtimes and payment bridges treat HTTP `402` as a protocol-level sig
 GET /api/x402/v1/quote?route=proof-package&asset_address=<asset_pda>&policy=collateral_screening
 ```
 
-Then sign locally with the dedicated Anchora wallet and retry the protected route with the helper-produced `X-PAYMENT` header. Do not pay with the bridge wallet.
+Then sign locally with the dedicated Anchora wallet. Do not try the protected URL first through that bridge. Instead:
+
+1. POST the helper's `facilitatorSettle.body` to `https://anchora.markets/api/x402/facilitator/settle`.
+2. GET `https://anchora.markets/api/x402/v1/payments/<paymentIdentifier>/status` until it returns `status: "settled"`.
+3. GET the original protected URL with the same helper-produced `X-PAYMENT` header to redeem the response.
+
+Do not pay with the bridge wallet. The protected URL recognizes the pre-settled facilitator attempt and caches the response without submitting the Solana transaction a second time.
 
 ## Helper Runner
 

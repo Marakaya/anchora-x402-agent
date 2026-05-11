@@ -8,7 +8,7 @@ Use this repository as the canonical command workspace for agent-side x402 testi
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.3.0` or newer:
+Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.0` or newer:
 
 ```bash
 git pull --ff-only
@@ -16,7 +16,7 @@ npm ci
 node -p "require('./package.json').version"
 ```
 
-Older copies may fetch the protected route directly for quote discovery, which can be slow or fail in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first.
+Older copies may fetch the protected route directly or try to redeem before settlement in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first and includes a bridge-safe facilitator-settle path.
 
 ## What This Does
 
@@ -25,7 +25,8 @@ Older copies may fetch the protected route directly for quote discovery, which c
 - Validates the quote against a local policy.
 - Creates a dedicated low-balance Solana agent wallet.
 - Signs a Solana USDC payment only when the quote matches policy.
-- Retries the same Anchora URL with `X-PAYMENT`.
+- Retries the same Anchora URL with `X-PAYMENT` in transparent HTTP clients.
+- Emits a `facilitatorSettle` request for bridges that intercept HTTP `402`.
 - Returns the proof-package response and settlement transaction.
 
 Current public judge/testing contour:
@@ -180,7 +181,8 @@ npm run x402:agent -- \
   --payment-identifier <same_payment_identifier>
 ```
 
-8. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward the helper-produced header verbatim; do not parse, edit, or rebuild it.
+8. If the bridge is transparent to `402`, retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward the helper-produced header verbatim; do not parse, edit, or rebuild it.
+9. If the bridge intercepts `402`, POST the returned `facilitatorSettle.body` to `facilitatorSettle.url`, then check `paymentStatus.url` until `status: "settled"`, then GET the target URL with the same `X-PAYMENT` header to redeem the response.
 
 Do not pay through the bridge wallet. The bridge should never receive the local wallet secret.
 

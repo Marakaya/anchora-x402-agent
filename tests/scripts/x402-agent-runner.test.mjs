@@ -8,6 +8,7 @@ import {
   DEFAULT_PAY_TO,
   DEFAULT_USDC_MINT,
   buildConfig,
+  buildFacilitatorSettleRequest,
   buildPaymentIdentifier,
   buildQuoteUrl,
   buildSignerRequest,
@@ -200,6 +201,27 @@ test('normalizeSignerResponse requires matching payment-identifier inside X-PAYM
     () => normalizeSignerResponse({ xPayment: encodePayment({ extensions: {} }) }, expectedId),
     /expected payment-identifier/
   );
+});
+
+test('buildFacilitatorSettleRequest decodes helper-produced X-PAYMENT without manual header rebuilding', () => {
+  const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
+  const requirement = validRequirement(targetUrl);
+  const paymentPayload = {
+    x402Version: 1,
+    scheme: 'exact',
+    payload: { transaction: 'signed-solana-transaction' },
+    extensions: {
+      'payment-identifier': {
+        info: { required: false, id: 'anchora_20260430_00112233445566778899aabb' },
+      },
+    },
+  };
+  const request = buildFacilitatorSettleRequest(encodePayment(paymentPayload), requirement);
+
+  assert.deepEqual(request, {
+    paymentPayload,
+    paymentRequirements: requirement,
+  });
 });
 
 test('resolveSignerUrl appends the default path and rejects non-local http signers', () => {
@@ -526,6 +548,59 @@ test('runOfflineAgentPayment builds a signer request from a saved quote without 
     result.signerRequest.extensions['payment-identifier'].info.id,
     'anchora_20260430_00112233445566778899aabb'
   );
+});
+
+test('runOfflineAgentPayment returns bridge-safe facilitator settle instructions after signing', async () => {
+  const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
+  const dir = mkdtempSync(join(tmpdir(), 'anchora-x402-offline-sign-'));
+  const quoteFile = join(dir, 'quote.json');
+  writeFileSync(quoteFile, JSON.stringify({ x402Version: 1, accepts: [validRequirement(targetUrl)] }));
+  const signerScript = `
+    let input = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { input += chunk; });
+    process.stdin.on('end', () => {
+      const request = JSON.parse(input);
+      const id = request.extensions['payment-identifier'].info.id;
+      const payload = {
+        x402Version: 1,
+        scheme: 'exact',
+        network: request.paymentRequirements.network,
+        payload: { transaction: 'signed-solana-transaction' },
+        extensions: { 'payment-identifier': { info: { required: false, id } } }
+      };
+      process.stdout.write(JSON.stringify({
+        xPayment: Buffer.from(JSON.stringify(payload)).toString('base64'),
+        paymentIdentifier: id,
+        payerAddress: 'payer'
+      }));
+    });
+  `;
+  const config = baseConfig({
+    argv: [
+      '--offline-sign',
+      '--quote-file',
+      quoteFile,
+      '--payment-identifier',
+      'anchora_20260430_00112233445566778899aabb',
+      '--signer-cmd',
+      JSON.stringify([process.execPath, '-e', signerScript]),
+    ],
+  });
+
+  const result = await runOfflineAgentPayment(config);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.offlineSign, true);
+  assert.equal(result.facilitatorSettle.url, 'https://anchora.markets/api/x402/facilitator/settle');
+  assert.equal(result.facilitatorSettle.method, 'POST');
+  assert.equal(result.facilitatorSettle.body.paymentPayload.payload.transaction, 'signed-solana-transaction');
+  assert.deepEqual(result.facilitatorSettle.body.paymentRequirements, validRequirement(targetUrl));
+  assert.equal(
+    result.paymentStatus.url,
+    'https://anchora.markets/api/x402/v1/payments/anchora_20260430_00112233445566778899aabb/status'
+  );
+  assert.equal(Array.isArray(result.next), true);
 });
 
 test('runAgentPayment refuses to sign when catalog settlement is not ready', async () => {
