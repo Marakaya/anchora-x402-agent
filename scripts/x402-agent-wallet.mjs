@@ -34,6 +34,7 @@ import {
 export const DEFAULT_WALLET_NAME = 'default';
 export const DEFAULT_WALLET_DIR = '.anchora/agent-wallets';
 export const DEFAULT_RPC_URL = 'https://api.devnet.solana.com';
+export const DEFAULT_RPC_PROXY_URL = 'https://anchora.markets/api/x402/solana-rpc';
 export const DEFAULT_DOMAIN = 'anchora.markets';
 export const DEFAULT_PAY_TO = 'DtWRumAEkL4AHfSwphuHf2RTmC2zJ9qP2wmGjtq4FxLP';
 export const DEFAULT_USDC_MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
@@ -364,13 +365,13 @@ export async function signX402Request({
   };
 }
 
-export async function buildSolanaExactPaymentPayload({ requirement, walletRecord, signer }) {
+export async function buildSolanaExactPaymentPayload({ request, requirement, walletRecord, signer }) {
   const policy = walletRecord.policy;
-  const rpc = createSolanaRpc(policy.rpcUrl || DEFAULT_RPC_URL);
+  const dataSource = createSolanaDataSource(policy.rpcUrl || DEFAULT_RPC_URL, request?.context?.solana ?? null);
   const mint = address(requirement.asset);
   const payTo = address(requirement.payTo);
   const signerAddress = address(signer.address);
-  const { tokenProgramAddress, decimals } = await fetchMintInfo(rpc, mint);
+  const { tokenProgramAddress, decimals } = await fetchMintInfo(dataSource, mint);
   const sourceAta = await deriveAssociatedTokenAddress({
     owner: signerAddress,
     mint,
@@ -383,13 +384,14 @@ export async function buildSolanaExactPaymentPayload({ requirement, walletRecord
   });
 
   await assertTokenAccountCanPay({
-    rpc,
+    dataSource,
     sourceAta,
     destinationAta,
+    sourceOwner: signerAddress,
     amountAtomic: BigInt(requirement.maxAmountRequired),
   });
 
-  const { value: latestBlockhash } = await rpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
+  const latestBlockhash = await dataSource.getLatestBlockhash();
   const transferIx = buildTransferCheckedInstruction({
     tokenProgramAddress,
     source: sourceAta,
@@ -410,7 +412,7 @@ export async function buildSolanaExactPaymentPayload({ requirement, walletRecord
   const transaction = getBase64EncodedWireTransaction(signedTransaction);
 
   if (policy.simulateBeforeSign !== false) {
-    await simulateSignedTransaction(rpc, transaction);
+    await dataSource.simulateTransaction(transaction);
   }
 
   return {
@@ -424,23 +426,23 @@ export async function buildSolanaExactPaymentPayload({ requirement, walletRecord
 }
 
 export async function getWalletBalances(walletRecord) {
-  const rpc = createSolanaRpc(walletRecord.policy.rpcUrl || DEFAULT_RPC_URL);
+  const dataSource = createSolanaDataSource(walletRecord.policy.rpcUrl || DEFAULT_RPC_URL, null);
   const signerAddress = address(walletRecord.address);
-  const sol = await rpc.getBalance(signerAddress, { commitment: 'confirmed' }).send();
+  const sol = await dataSource.getBalance(signerAddress);
   const mint = address(walletRecord.policy.allowedUsdcMint);
-  const { tokenProgramAddress } = await fetchMintInfo(rpc, mint);
+  const { tokenProgramAddress } = await fetchMintInfo(dataSource, mint);
   const ata = await deriveAssociatedTokenAddress({
     owner: signerAddress,
     mint,
     tokenProgramAddress,
   });
-  const tokenAccount = await fetchBase64Account(rpc, ata);
+  const tokenAccount = await fetchBase64Account(dataSource, ata, signerAddress);
   const usdcAtomic = tokenAccount ? String(readTokenAccountAmount(tokenAccount.data)) : '0';
 
   return {
     address: walletRecord.address,
-    solLamports: String(sol.value),
-    sol: lamportsToSolString(sol.value),
+    solLamports: String(sol.value ?? sol),
+    sol: lamportsToSolString(sol.value ?? sol),
     usdcAtomic,
     usdc: atomicToUsdcString(usdcAtomic),
     usdcTokenAccount: ata.toString(),
@@ -492,8 +494,8 @@ function buildMemo(requirement) {
   return crypto.randomBytes(16).toString('hex');
 }
 
-async function fetchMintInfo(rpc, mintAddress) {
-  const account = await fetchBase64Account(rpc, mintAddress);
+async function fetchMintInfo(dataSource, mintAddress) {
+  const account = await fetchBase64Account(dataSource, mintAddress);
   if (!account) {
     throw new AgentWalletError(`USDC mint account not found: ${mintAddress}`);
   }
@@ -510,10 +512,10 @@ async function fetchMintInfo(rpc, mintAddress) {
   };
 }
 
-async function assertTokenAccountCanPay({ rpc, sourceAta, destinationAta, amountAtomic }) {
+async function assertTokenAccountCanPay({ dataSource, sourceAta, destinationAta, sourceOwner, amountAtomic }) {
   const [sourceAccount, destinationAccount] = await Promise.all([
-    fetchBase64Account(rpc, sourceAta),
-    fetchBase64Account(rpc, destinationAta),
+    fetchBase64Account(dataSource, sourceAta, sourceOwner),
+    fetchBase64Account(dataSource, destinationAta),
   ]);
 
   if (!sourceAccount) {
@@ -535,22 +537,8 @@ async function assertTokenAccountCanPay({ rpc, sourceAta, destinationAta, amount
   }
 }
 
-async function fetchBase64Account(rpc, accountAddress) {
-  const response = await rpc
-    .getAccountInfo(accountAddress, { encoding: 'base64', commitment: 'confirmed' })
-    .send();
-  if (!response.value) return null;
-
-  const [encoded, encoding] = response.value.data;
-  if (encoding !== 'base64') {
-    throw new AgentWalletError(`Unexpected account encoding: ${encoding}`);
-  }
-
-  return {
-    owner: response.value.owner.toString(),
-    lamports: response.value.lamports,
-    data: Buffer.from(encoded, 'base64'),
-  };
+async function fetchBase64Account(dataSource, accountAddress, ownerAddress = null) {
+  return dataSource.getAccountInfo(accountAddress, ownerAddress);
 }
 
 function readTokenAccountAmount(data) {
@@ -572,6 +560,147 @@ async function deriveAssociatedTokenAddress({ owner, mint, tokenProgramAddress }
   return ata;
 }
 
+function createSolanaDataSource(rpcUrl, solanaContext) {
+  if (solanaContext) return createContextSolanaDataSource(solanaContext);
+  if (isAnchoraRpcProxyUrl(rpcUrl)) return createProxySolanaDataSource(rpcUrl);
+
+  const rpc = createSolanaRpc(rpcUrl || DEFAULT_RPC_URL);
+  return {
+    kind: 'rpc',
+    async getAccountInfo(accountAddress) {
+      const response = await rpc
+        .getAccountInfo(accountAddress, { encoding: 'base64', commitment: 'confirmed' })
+        .send();
+      return normalizeRpcAccount(response.value);
+    },
+    async getLatestBlockhash() {
+      const { value } = await rpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
+      return value;
+    },
+    async getBalance(accountAddress) {
+      return rpc.getBalance(accountAddress, { commitment: 'confirmed' }).send();
+    },
+    async simulateTransaction(transaction) {
+      return simulateSignedTransaction(rpc, transaction);
+    },
+  };
+}
+
+function createContextSolanaDataSource(solanaContext) {
+  return {
+    kind: 'context',
+    async getAccountInfo(accountAddress) {
+      const account = contextAccount(solanaContext, accountAddress);
+      return account ? normalizeContextAccount(account) : null;
+    },
+    async getLatestBlockhash() {
+      const latestBlockhash = solanaContext.latestBlockhash ?? solanaContext.blockhash;
+      if (!latestBlockhash?.blockhash || latestBlockhash.lastValidBlockHeight === undefined) {
+        throw new AgentWalletError('Offline Solana context is missing latestBlockhash');
+      }
+      return {
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: BigInt(latestBlockhash.lastValidBlockHeight),
+      };
+    },
+    async getBalance(accountAddress) {
+      const balances = solanaContext.balances ?? {};
+      const value = balances[String(accountAddress)]?.value ?? balances[String(accountAddress)] ?? 0;
+      return { value: BigInt(value) };
+    },
+    async simulateTransaction() {
+      return null;
+    },
+  };
+}
+
+function createProxySolanaDataSource(rpcProxyUrl) {
+  return {
+    kind: 'anchora-rpc-proxy',
+    async getAccountInfo(accountAddress, ownerAddress = null) {
+      const url = new URL(rpcProxyUrl);
+      url.searchParams.set('method', 'account');
+      url.searchParams.set('address', String(accountAddress));
+      if (ownerAddress) url.searchParams.set('owner', String(ownerAddress));
+      const body = await fetchProxyJson(url.href);
+      return body.account ? normalizeContextAccount(body.account) : null;
+    },
+    async getLatestBlockhash() {
+      const url = new URL(rpcProxyUrl);
+      url.searchParams.set('method', 'latest-blockhash');
+      const body = await fetchProxyJson(url.href);
+      if (!body.latestBlockhash?.blockhash) {
+        throw new AgentWalletError('Anchora Solana RPC proxy did not return a latest blockhash');
+      }
+      return {
+        blockhash: body.latestBlockhash.blockhash,
+        lastValidBlockHeight: BigInt(body.latestBlockhash.lastValidBlockHeight),
+      };
+    },
+    async getBalance(accountAddress) {
+      const url = new URL(rpcProxyUrl);
+      url.searchParams.set('method', 'balance');
+      url.searchParams.set('address', String(accountAddress));
+      const body = await fetchProxyJson(url.href);
+      return { value: BigInt(body.balance?.lamports ?? 0) };
+    },
+    async simulateTransaction() {
+      return null;
+    },
+  };
+}
+
+async function fetchProxyJson(url) {
+  const response = await fetch(url);
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new AgentWalletError(`Anchora Solana RPC proxy returned HTTP ${response.status}`, body);
+  }
+  return body;
+}
+
+function normalizeRpcAccount(value) {
+  if (!value) return null;
+  const [encoded, encoding] = value.data;
+  if (encoding !== 'base64') {
+    throw new AgentWalletError(`Unexpected account encoding: ${encoding}`);
+  }
+  return {
+    owner: value.owner.toString(),
+    lamports: value.lamports,
+    data: Buffer.from(encoded, 'base64'),
+  };
+}
+
+function normalizeContextAccount(value) {
+  const account = value?.account ?? value;
+  if (!account) return null;
+  const data = Array.isArray(account.data) ? account.data[0] : account.data;
+  if (typeof account.owner !== 'string' || typeof data !== 'string') {
+    throw new AgentWalletError('Offline Solana context account must include owner and base64 data');
+  }
+  return {
+    owner: account.owner,
+    lamports: account.lamports ?? 0,
+    data: Buffer.from(data, 'base64'),
+  };
+}
+
+function contextAccount(solanaContext, accountAddress) {
+  const accounts = solanaContext.accounts ?? {};
+  return accounts[String(accountAddress)] ?? null;
+}
+
+function isAnchoraRpcProxyUrl(value) {
+  const raw = String(value ?? '').trim();
+  if (raw === 'anchora-proxy') return true;
+  try {
+    return new URL(raw).pathname === '/api/x402/solana-rpc';
+  } catch {
+    return false;
+  }
+}
+
 async function simulateSignedTransaction(rpc, transaction) {
   const result = await rpc
     .simulateTransaction(transaction, {
@@ -589,6 +718,82 @@ async function simulateSignedTransaction(rpc, transaction) {
     const logs = Array.isArray(result.value.logs) ? result.value.logs.slice(-6) : [];
     throw new AgentWalletError('Signed x402 transaction simulation failed', { error, logs });
   }
+}
+
+export async function buildContextPlan(walletRecord, request, rpcProxyUrl = DEFAULT_RPC_PROXY_URL) {
+  const validation = validateSignerRequest(request, walletRecord, new Date());
+  if (!validation.ok) {
+    throw new AgentWalletError('Cannot build context plan for a signer request outside wallet policy', validation.errors);
+  }
+
+  const requirement = request.paymentRequirements;
+  const signerAddress = address(walletRecord.address);
+  const mint = address(requirement.asset);
+  const payTo = address(requirement.payTo);
+  const sourceTokenAta = await deriveAssociatedTokenAddress({
+    owner: signerAddress,
+    mint,
+    tokenProgramAddress: address(TOKEN_PROGRAM_ADDRESS),
+  });
+  const sourceToken2022Ata = await deriveAssociatedTokenAddress({
+    owner: signerAddress,
+    mint,
+    tokenProgramAddress: address(TOKEN_2022_PROGRAM_ADDRESS),
+  });
+  const destinationTokenAta = await deriveAssociatedTokenAddress({
+    owner: payTo,
+    mint,
+    tokenProgramAddress: address(TOKEN_PROGRAM_ADDRESS),
+  });
+  const destinationToken2022Ata = await deriveAssociatedTokenAddress({
+    owner: payTo,
+    mint,
+    tokenProgramAddress: address(TOKEN_2022_PROGRAM_ADDRESS),
+  });
+
+  return {
+    ok: true,
+    walletAddress: walletRecord.address,
+    rpcProxyUrl,
+    fetchWithBridge: [
+      { key: 'latestBlockhash', url: proxyUrl(rpcProxyUrl, { method: 'latest-blockhash' }) },
+      { key: `accounts.${requirement.asset}`, url: proxyUrl(rpcProxyUrl, { method: 'account', address: requirement.asset }) },
+      {
+        key: `accounts.${sourceTokenAta}`,
+        url: proxyUrl(rpcProxyUrl, { method: 'account', address: sourceTokenAta, owner: walletRecord.address }),
+      },
+      {
+        key: `accounts.${sourceToken2022Ata}`,
+        url: proxyUrl(rpcProxyUrl, { method: 'account', address: sourceToken2022Ata, owner: walletRecord.address }),
+      },
+      {
+        key: `accounts.${destinationTokenAta}`,
+        url: proxyUrl(rpcProxyUrl, { method: 'account', address: destinationTokenAta }),
+      },
+      {
+        key: `accounts.${destinationToken2022Ata}`,
+        url: proxyUrl(rpcProxyUrl, { method: 'account', address: destinationToken2022Ata }),
+      },
+    ],
+    contextTemplate: {
+      latestBlockhash: 'paste latestBlockhash response object here',
+      accounts: {
+        [requirement.asset]: 'paste account response object here',
+        [sourceTokenAta]: 'paste account response object here if non-null',
+        [sourceToken2022Ata]: 'paste account response object here if non-null',
+        [destinationTokenAta]: 'paste account response object here if non-null',
+        [destinationToken2022Ata]: 'paste account response object here if non-null',
+      },
+    },
+  };
+}
+
+function proxyUrl(baseUrl, params) {
+  const url = new URL(baseUrl);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  return url.href;
 }
 
 function recordSpend(walletRecord, entry) {
@@ -829,9 +1034,21 @@ async function runSignX402(args) {
   const walletDir = resolveWalletDir(args['wallet-dir']);
   const record = loadWalletRecord(String(args.wallet ?? DEFAULT_WALLET_NAME), walletDir);
   const request = JSON.parse(await readStdin());
+  if (args['no-simulate'] === true) record.policy.simulateBeforeSign = false;
   const response = await signX402Request({ walletRecord: record, request });
   saveWalletRecord(record, walletDir);
   return response;
+}
+
+async function runContextPlan(args) {
+  const walletDir = resolveWalletDir(args['wallet-dir']);
+  const record = loadWalletRecord(String(args.wallet ?? DEFAULT_WALLET_NAME), walletDir);
+  const request = JSON.parse(await readStdin());
+  return buildContextPlan(
+    record,
+    request,
+    String(args['rpc-proxy-url'] ?? process.env.ANCHORA_X402_RPC_PROXY_URL ?? DEFAULT_RPC_PROXY_URL)
+  );
 }
 
 async function readStdin() {
@@ -854,6 +1071,7 @@ async function main() {
   else if (command === 'info') result = await runInfo(args);
   else if (command === 'balance') result = await runBalance(args);
   else if (command === 'sign-x402') result = await runSignX402(args);
+  else if (command === 'context-plan') result = await runContextPlan(args);
   else throw new AgentWalletError(`Unknown command "${command}"`);
 
   console.log(JSON.stringify(result, null, 2));

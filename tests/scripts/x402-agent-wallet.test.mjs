@@ -5,6 +5,7 @@ import {
   DEFAULT_PAY_TO,
   DEFAULT_USDC_MINT,
   atomicToUsdcString,
+  buildContextPlan,
   createWalletRecord,
   signX402Request,
   usdcToAtomicString,
@@ -175,4 +176,21 @@ test('signX402Request returns base64 x402 payload and records local spend', asyn
   );
   assert.equal(record.ledger.spentAtomic, '50000');
   assert.equal(record.ledger.payments.length, 1);
+});
+
+test('buildContextPlan returns bridge-fetchable Solana RPC context URLs', async () => {
+  const record = await createWalletRecord({
+    name: 'test',
+    now: new Date('2026-04-30T00:00:00.000Z'),
+  });
+  const plan = await buildContextPlan(record, signerRequest(), 'https://anchora.markets/api/x402/solana-rpc');
+
+  assert.equal(plan.ok, true);
+  assert.equal(plan.walletAddress, record.address);
+  assert.equal(plan.fetchWithBridge.some(item => item.key === 'latestBlockhash'), true);
+  assert.equal(
+    plan.fetchWithBridge.some(item => item.url.includes('method=account') && item.url.includes(DEFAULT_USDC_MINT)),
+    true
+  );
+  assert.equal(Object.keys(plan.contextTemplate.accounts).includes(DEFAULT_USDC_MINT), true);
 });

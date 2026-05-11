@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -12,6 +15,7 @@ import {
   normalizeSignerResponse,
   resolveSignerUrl,
   runAgentPayment,
+  runOfflineAgentPayment,
   selectPaymentRequirement,
   validatePaymentRequirement,
 } from '../../scripts/x402-agent-runner.mjs';
@@ -312,6 +316,33 @@ test('runAgentPayment treats quote-only validation as a successful dry run', asy
   } finally {
     globalThis.fetch = previousFetch;
   }
+});
+
+test('runOfflineAgentPayment builds a signer request from a saved quote without network fetches', async () => {
+  const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
+  const dir = mkdtempSync(join(tmpdir(), 'anchora-x402-offline-'));
+  const quoteFile = join(dir, 'quote.json');
+  writeFileSync(quoteFile, JSON.stringify({ x402Version: 1, accepts: [validRequirement(targetUrl)] }));
+  const config = baseConfig({
+    argv: [
+      '--offline-context-plan',
+      '--quote-file',
+      quoteFile,
+      '--payment-identifier',
+      'anchora_20260430_00112233445566778899aabb',
+    ],
+  });
+
+  const result = await runOfflineAgentPayment(config);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.offlineContextPlan, true);
+  assert.equal(result.signerRequest.type, 'x402.sign');
+  assert.equal(result.signerRequest.paymentRequirements.resource, targetUrl);
+  assert.equal(
+    result.signerRequest.extensions['payment-identifier'].info.id,
+    'anchora_20260430_00112233445566778899aabb'
+  );
 });
 
 test('runAgentPayment refuses to sign when catalog settlement is not ready', async () => {

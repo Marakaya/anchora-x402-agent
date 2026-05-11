@@ -106,6 +106,44 @@ npm run x402:agent -- \
 
 The local wallet refuses wrong domain, wrong route prefix, wrong Solana x402 network, wrong USDC mint, wrong recipient, over-cap amount, over daily cap, and missing `payment-identifier`.
 
+## No-direct-network fallback
+
+Some agent sandboxes keep the wallet file in a local process that cannot resolve `anchora.markets` or `api.devnet.solana.com`, while the agent itself can still make HTTP requests through a bridge. In that case, keep the local Anchora wallet as payer and use the bridge only as transport.
+
+1. Fetch the target route without `X-PAYMENT` through the bridge and save the `402` body as `quote.json`.
+2. Build an offline plan:
+
+```bash
+npm run x402:agent -- \
+  --offline-context-plan \
+  --quote-file quote.json \
+  --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX \
+  --agent-wallet default
+```
+
+3. Save `signerRequest` from the output as `signer-request.json`, then run:
+
+```bash
+npm run x402:wallet -- context-plan --wallet default < signer-request.json
+```
+
+4. Fetch every `fetchWithBridge[].url` through the bridge and build `solana-context.json`.
+5. Sign locally:
+
+```bash
+npm run x402:agent -- \
+  --offline-sign \
+  --quote-file quote.json \
+  --solana-context-file solana-context.json \
+  --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX \
+  --agent-wallet default \
+  --payment-identifier <same_payment_identifier>
+```
+
+6. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header.
+
+Do not pay through the bridge wallet. The bridge should never receive the local wallet secret.
+
 ## Installable Skill
 
 Use `SKILL.md` as the agent skill instruction. Copy or install it into the agent environment that supports local skills.

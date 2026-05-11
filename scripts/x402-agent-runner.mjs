@@ -164,6 +164,15 @@ export function buildConfig(argv = process.argv.slice(2), env = process.env) {
     printBody:
       args['print-body'] === true ||
       env.ANCHORA_X402_PRINT_BODY === 'true',
+    offlineSign:
+      args['offline-sign'] === true ||
+      env.ANCHORA_X402_OFFLINE_SIGN === 'true',
+    offlineContextPlan:
+      args['offline-context-plan'] === true ||
+      env.ANCHORA_X402_OFFLINE_CONTEXT_PLAN === 'true',
+    quoteFile: optionalString(args['quote-file'] ?? env.ANCHORA_X402_QUOTE_FILE),
+    solanaContextFile: optionalString(args['solana-context-file'] ?? env.ANCHORA_X402_SOLANA_CONTEXT_FILE),
+    paymentIdentifier: optionalString(args['payment-identifier'] ?? env.ANCHORA_X402_PAYMENT_IDENTIFIER),
     timeoutMs: positiveInteger(args.timeout ?? env.ANCHORA_X402_TIMEOUT_MS, 30_000),
   };
 }
@@ -280,7 +289,7 @@ export function validatePaymentRequirement(requirement, options) {
   return { ok: errors.length === 0, errors };
 }
 
-export function buildSignerRequest({ config, quoteBody, requirement, targetUrl, paymentIdentifier }) {
+export function buildSignerRequest({ config, quoteBody, requirement, targetUrl, paymentIdentifier, solanaContext = null }) {
   return {
     type: 'x402.sign',
     x402Version: Number(quoteBody?.x402Version ?? 1),
@@ -309,6 +318,7 @@ export function buildSignerRequest({ config, quoteBody, requirement, targetUrl, 
         payTo: config.expectedPayTo,
         maxAtomicAmount: config.maxAtomicAmount,
       },
+      ...(solanaContext ? { solana: solanaContext } : {}),
     },
   };
 }
@@ -440,6 +450,10 @@ export function normalizeSignerResponse(responseBody, expectedPaymentIdentifier)
 export async function runAgentPayment(config) {
   const targetUrl = buildTargetUrl(config);
 
+  if (config.offlineSign || config.offlineContextPlan) {
+    return runOfflineAgentPayment(config, targetUrl);
+  }
+
   if (config.route === 'catalog') {
     const { catalogBody, catalogResponse } = await fetchCatalog(config);
 
@@ -526,7 +540,7 @@ export async function runAgentPayment(config) {
         payload: signerPayload,
         timeoutMs: config.timeoutMs,
       })
-    : await callHttpSigner({
+      : await callHttpSigner({
         signerUrl: config.signerUrl,
         signerToken: config.signerToken,
         allowHttpSigner: config.allowHttpSigner,
@@ -554,6 +568,102 @@ export async function runAgentPayment(config) {
     paymentResponse,
     body: config.printBody ? paidBody : summarizeBody(paidBody),
   };
+}
+
+export async function runOfflineAgentPayment(config, targetUrl = buildTargetUrl(config)) {
+  if (!config.quoteFile) {
+    throw new AgentRunnerError('--quote-file is required for offline x402 signing');
+  }
+  if (config.route === 'catalog') {
+    throw new AgentRunnerError('Offline signing is only for paid x402 routes, not catalog');
+  }
+
+  const quoteBody = readJsonFile(config.quoteFile);
+  const requirement = selectPaymentRequirement(quoteBody);
+  if (!requirement) {
+    throw new AgentRunnerError('No Solana exact payment requirement found in offline quote');
+  }
+
+  const validation = validatePaymentRequirement(requirement, {
+    expectedUrl: targetUrl,
+    expectedPayTo: config.expectedPayTo,
+    expectedUsdcMint: config.expectedUsdcMint,
+    expectedNetwork: config.expectedNetwork,
+    maxAtomicAmount: config.maxAtomicAmount,
+  });
+  if (!validation.ok) {
+    throw new AgentRunnerError('Offline payment requirement failed local policy checks', validation.errors);
+  }
+
+  const paymentIdentifier = config.paymentIdentifier || buildPaymentIdentifier();
+  const solanaContext = config.solanaContextFile ? readJsonFile(config.solanaContextFile) : null;
+  const signerPayload = buildSignerRequest({
+    config,
+    quoteBody,
+    requirement,
+    targetUrl,
+    paymentIdentifier,
+    solanaContext,
+  });
+
+  if (config.offlineContextPlan) {
+    return {
+      ok: true,
+      dryRun: true,
+      offlineContextPlan: true,
+      targetUrl,
+      route: config.route,
+      paymentIdentifier,
+      signerRequest: signerPayload,
+      contextPlanCommand: `npm run x402:wallet -- context-plan --wallet ${config.agentWallet ?? '<wallet>'} < signer-request.json`,
+      offlineSignCommand: `npm run x402:agent -- --offline-sign --quote-file ${config.quoteFile} --solana-context-file solana-context.json --asset-address ${config.assetAddress ?? '<asset_pda>'} --agent-wallet ${config.agentWallet ?? '<wallet>'} --payment-identifier ${paymentIdentifier}`,
+      next: [
+        'Save signerRequest as signer-request.json.',
+        'Run: npm run x402:wallet -- context-plan --wallet <wallet> < signer-request.json',
+        'Fetch the listed URLs with the agent HTTP bridge and save the resulting context JSON.',
+        'Run offline signing with --offline-sign --quote-file <quote.json> --solana-context-file <context.json>.',
+      ],
+    };
+  }
+
+  const signerResponse = config.signerCommand
+    ? await callCommandSigner({
+        signerCommand: config.signerCommand,
+        payload: signerPayload,
+        timeoutMs: config.timeoutMs,
+      })
+    : await callHttpSigner({
+        signerUrl: config.signerUrl,
+        signerToken: config.signerToken,
+        allowHttpSigner: config.allowHttpSigner,
+        payload: signerPayload,
+        timeoutMs: config.timeoutMs,
+      });
+
+  const { xPayment, payerAddress } = normalizeSignerResponse(signerResponse, paymentIdentifier);
+
+  return {
+    ok: true,
+    dryRun: false,
+    offlineSign: true,
+    targetUrl,
+    route: config.route,
+    policy: config.route === 'proof-package' ? config.policy : null,
+    payerAddress,
+    paymentIdentifier,
+    headers: { 'X-PAYMENT': xPayment },
+    next: 'Retry the exact targetUrl with this X-PAYMENT header using the available HTTP bridge.',
+  };
+}
+
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch (error) {
+    throw new AgentRunnerError(`Could not read JSON file: ${path}`, {
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 async function readJsonOrText(response) {
@@ -764,6 +874,8 @@ Environment:
   ANCHORA_X402_AGENT_WALLET     Local .anchora agent wallet name; uses scripts/x402-agent-wallet.mjs
   ANCHORA_X402_ASSET_ADDRESS    Asset contract/PDA address for score/proof-package/investor-report routes
   ANCHORA_X402_EXECUTE_PAYMENT  Set true to execute a real signer-backed payment
+  ANCHORA_X402_OFFLINE_SIGN     Sign from a saved 402 quote/context without local network fetches
+  ANCHORA_X402_QUOTE_FILE       Saved 402 JSON quote used by offline signing
 
 By default the runner validates the 402 quote and stops before payment.
 Use --route catalog for free discovery before choosing a paid route.`);

@@ -37,6 +37,8 @@ https://github.com/Marakaya/anchora-x402-agent
 
 Use this public helper repo as the canonical command workspace. Do not require access to the private Anchora app repository for x402 setup, wallet creation, quote validation, or payment retries.
 
+For browser-based judge/developer review, the live app also exposes `/developer/playground`, `/developer/logs`, `/developer/receipts`, `/developer/errors`, and `/developer/agent-skill` under `https://app.anchora.markets`.
+
 If the current workspace is not that repo:
 
 1. Obtain the public helper repo as a local command workspace. Git is optional:
@@ -120,6 +122,46 @@ npm run x402:agent -- --asset-address <asset_pda> --agent-wallet default --execu
 
 The wallet refuses quotes outside `https://anchora.markets/api/x402/v1/*`, wrong USDC mint, wrong recipient, over-cap amounts, over daily cap, or missing `payment-identifier`.
 
+### No-direct-network fallback
+
+If the shell can run Node and access the local wallet file but cannot resolve `anchora.markets` or `api.devnet.solana.com`, do not switch to a bridge payment wallet. Use the agent's HTTP bridge only as transport:
+
+1. Fetch `/catalog` through the bridge.
+2. Fetch the target route without `X-PAYMENT` through the bridge and save the `402` JSON body as `quote.json`.
+3. Build an offline context plan:
+
+```bash
+npm run x402:agent -- --offline-context-plan --quote-file quote.json --asset-address <asset_pda> --agent-wallet default
+```
+
+4. Save the returned `signerRequest` as `signer-request.json`.
+5. Run:
+
+```bash
+npm run x402:wallet -- context-plan --wallet default < signer-request.json
+```
+
+6. Fetch every `fetchWithBridge[].url` through the bridge. Save `solana-context.json` as:
+
+```json
+{
+  "latestBlockhash": { "...": "paste latestBlockhash response object" },
+  "accounts": {
+    "<account-address>": { "...": "paste non-null account response object" }
+  }
+}
+```
+
+7. Sign locally with the same `paymentIdentifier` from step 3:
+
+```bash
+npm run x402:agent -- --offline-sign --quote-file quote.json --solana-context-file solana-context.json --asset-address <asset_pda> --agent-wallet default --payment-identifier <same_payment_identifier>
+```
+
+8. Retry the exact target URL through the bridge with the returned `X-PAYMENT` header.
+
+This keeps the dedicated Anchora wallet as payer. The bridge transports HTTP/RPC data only; it must not create or fund the payment.
+
 ## Helper Runner
 
 When operating inside the public helper repo, prefer the bundled runner:
@@ -164,7 +206,7 @@ If available, read `docs/runbooks/x402-agent-signer.md` for the full signer cont
 Known-compatible CLI smoke:
 
 ```bash
-npx -y @solana/pay --verbose curl https://anchora.markets/api/x402/v1/assets/2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX/proof-package
+npm exec --yes --package=@solana/pay -- pay --verbose curl https://anchora.markets/api/x402/v1/assets/2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX/proof-package
 ```
 
 ## Response Guidance
