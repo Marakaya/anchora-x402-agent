@@ -9,11 +9,30 @@ Anchora sells machine-readable trust for real-world assets. Use the x402 rail wh
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.4.1` or newer. Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, or fall back to manual REPL signing in read-only sandboxes. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, and supports filesystem-free in-memory signing.
+Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.4.2` or newer. Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, fall back to manual REPL signing in read-only sandboxes, or spend time inspecting the private Anchora repo for a payment-only task. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, supports filesystem-free in-memory signing, and has a strict fast path for agent payments.
 
 Current production-facing settlement is server-side and declared in `/api/x402/v1/catalog`. Anchora may use Coinbase CDP or `direct-solana` proof mode. In a transparent HTTP client, the agent checks `settlement.ready`, calls Anchora, receives a quote, signs a Solana USDC payment through a bounded signer, retries Anchora with `X-PAYMENT`, and Anchora verifies/settles server-side. In a bridge that intercepts HTTP `402`, the agent uses the helper's returned `facilitatorSettle` body first, then redeems the same target URL with the same `X-PAYMENT`.
 
 For hackathon or judge testing, use devnet only. Mainnet x402 settlement has a historical proof transaction, but public hands-on testing should fund only devnet SOL and devnet test USDC declared by `/catalog`.
+
+## Payment-Only Fast Path
+
+If the user asks to buy or fetch Anchora data through x402, treat it as a payment-only task. Do not inspect the private Anchora app repository, Graphify files, project memory, README, source code, migrations, or unrelated docs. Do not web-search for Anchora instructions after this skill has been loaded. The public helper repo, `/catalog`, `/quote`, and `/api/x402/solana-rpc?method=signing-context` are sufficient.
+
+Allowed discovery before payment:
+
+- confirm the helper workspace version with `node -p "require('./package.json').version"` when already in the helper repo
+- fetch `GET /catalog`
+- fetch `GET /quote`
+- check wallet balance or signing context
+
+Only inspect helper source or project code after two consecutive failures from the same helper command or an undocumented response shape from Anchora. Never use Node REPL to create or sign a wallet while `create-in-memory` or `sign-x402-stdin` is available. If filesystem writes fail, switch directly to `create-in-memory`; do not try `.anchora`, `mktemp`, and then REPL in sequence.
+
+Target timing:
+
+- already funded wallet: one catalog/quote/sign/settle/redeem pass
+- new wallet: show public key, wait for user funding, then one payment pass
+- hostile bridge/no-direct-network: use `/quote`, one signing-context request, `sign-x402-stdin`, facilitator-settle, status check, redeem
 
 ## Safety Rules
 

@@ -8,7 +8,7 @@ Use this repository as the canonical command workspace for agent-side x402 testi
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.1` or newer:
+Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.2` or newer:
 
 ```bash
 git pull --ff-only
@@ -16,7 +16,7 @@ npm ci
 node -p "require('./package.json').version"
 ```
 
-Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, or fall back to manual REPL signing in read-only sandboxes. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, and supports filesystem-free in-memory signing.
+Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, fall back to manual REPL signing in read-only sandboxes, or spend time inspecting the private Anchora repo for a payment-only task. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, supports filesystem-free in-memory signing, and has a strict fast path for agent payments.
 
 ## What This Does
 
@@ -46,6 +46,27 @@ Always prefer the live catalog as source of truth:
 ```bash
 npm run catalog
 ```
+
+## Payment-Only Fast Path
+
+For a normal agent task such as "pay for the proof package" or "fetch this asset through x402", do not inspect the private Anchora app repo, Graphify files, migrations, source code, or unrelated docs. This helper repo plus the live `/catalog`, `/quote`, and signing-context endpoint are the supported interface.
+
+Allowed discovery before payment:
+
+- `node -p "require('./package.json').version"`
+- `npm run catalog`
+- `GET /quote`
+- wallet balance or signing-context checks
+
+Only inspect helper source or project code after two consecutive failures from the same helper command or an undocumented response shape from Anchora. If filesystem writes fail, switch directly to `create-in-memory`; do not try `.anchora`, `mktemp`, and manual Node REPL signing in sequence.
+
+Expected hostile-environment path:
+
+1. Create an in-memory wallet.
+2. Ask the user to fund the printed public key.
+3. Fetch `/catalog`, `/quote`, and signing context through the bridge.
+4. Sign with `sign-x402-stdin`.
+5. POST `facilitatorSettle.body`, check payment status, then redeem the target URL.
 
 Bridge-safe quote endpoint:
 
