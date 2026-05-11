@@ -9,7 +9,7 @@ Anchora sells machine-readable trust for real-world assets. Use the x402 rail wh
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.4.0` or newer. Older copies may fetch the protected route directly or try to redeem before settlement in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first and includes a bridge-safe facilitator-settle path.
+Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.4.1` or newer. Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, or fall back to manual REPL signing in read-only sandboxes. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, and supports filesystem-free in-memory signing.
 
 Current production-facing settlement is server-side and declared in `/api/x402/v1/catalog`. Anchora may use Coinbase CDP or `direct-solana` proof mode. In a transparent HTTP client, the agent checks `settlement.ready`, calls Anchora, receives a quote, signs a Solana USDC payment through a bounded signer, retries Anchora with `X-PAYMENT`, and Anchora verifies/settles server-side. In a bridge that intercepts HTTP `402`, the agent uses the helper's returned `facilitatorSettle` body first, then redeems the same target URL with the same `X-PAYMENT`.
 
@@ -114,6 +114,27 @@ wallet_dir="$(mktemp -d)"
 npm run x402:wallet -- create --wallet default --wallet-dir "$wallet_dir" --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
 ```
 
+If no filesystem location is writable, use in-memory mode instead of writing Node REPL code manually:
+
+```bash
+npm run x402:wallet -- create-in-memory --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
+```
+
+This prints a generated low-balance `walletRecord` that contains a secret key. Keep it inside the agent runtime only, do not show it to the user, and use it only for the authorized Anchora x402 policy. After funding the printed public key, sign a saved `signerRequest` without touching the filesystem:
+
+```bash
+npm run x402:wallet -- sign-x402-stdin < inline-wallet-sign-request.json
+```
+
+`inline-wallet-sign-request.json` shape:
+
+```json
+{
+  "walletRecord": { "...": "walletRecord from create-in-memory" },
+  "signerRequest": { "...": "signerRequest from offline-context-plan" }
+}
+```
+
 Tell the user to fund the printed public key with:
 
 ```text
@@ -186,7 +207,7 @@ npm run x402:agent -- --offline-sign --quote-file quote.json --solana-context-fi
 
 This keeps the dedicated Anchora wallet as payer. The bridge transports HTTP/RPC data only; it must not create or fund the payment.
 
-Do not run a separate facilitator pre-verify in restricted bridge mode. It can consume enough time for the blockhash to expire. Retry only when facilitator-settle or the paid retry returns a structured pre-send error such as `blockhash_expired` with `phase: "verify"` or `phase: "build"` and `retryable: true`. If the response is `settlement_pending` with `checkTransaction`, do not re-sign or repay; check server status first:
+Do not run a separate facilitator pre-verify in restricted bridge mode. It can consume enough time for the blockhash to expire. Retry only when facilitator-settle or the paid retry returns a structured `blockhash_expired` error with `retryable: true` and no `checkTransaction`. If the response is `settlement_pending` with `checkTransaction`, do not re-sign or repay; check server status first:
 
 ```bash
 npm run x402:agent -- --check-payment <payment_identifier>
@@ -207,6 +228,8 @@ Then sign locally with the dedicated Anchora wallet. Do not try the protected UR
 3. GET the original protected URL with the same helper-produced `X-PAYMENT` header to redeem the response.
 
 Do not pay with the bridge wallet. The protected URL recognizes the pre-settled facilitator attempt and caches the response without submitting the Solana transaction a second time.
+
+Facilitator-settle technical failures intentionally do not use HTTP `402`; they return structured `409` or `502` JSON so x402-aware bridges do not swallow the body. If you still see `402 Payment Required but no recognized protocol` from facilitator-settle, refresh the helper/skill first.
 
 ## Helper Runner
 

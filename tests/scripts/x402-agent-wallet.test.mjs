@@ -8,6 +8,7 @@ import {
   buildContextPlan,
   createWalletRecord,
   signX402Request,
+  signX402WithInlineWallet,
   usdcToAtomicString,
   validateSignerRequest,
   validateWalletRecord,
@@ -176,6 +177,37 @@ test('signX402Request returns base64 x402 payload and records local spend', asyn
   );
   assert.equal(record.ledger.spentAtomic, '50000');
   assert.equal(record.ledger.payments.length, 1);
+});
+
+test('signX402WithInlineWallet signs without filesystem state and returns updated wallet record', async () => {
+  const record = await createWalletRecord({
+    name: 'ephemeral',
+    now: new Date('2026-04-30T00:00:00.000Z'),
+  });
+
+  const result = await signX402WithInlineWallet(
+    {
+      walletRecord: record,
+      signerRequest: signerRequest(),
+    },
+    {
+      now: new Date('2026-04-30T12:00:00.000Z'),
+      paymentBuilder: async ({ requirement }) => ({
+        x402Version: 1,
+        scheme: requirement.scheme,
+        network: requirement.network,
+        payload: { transaction: 'signed-inline-transaction' },
+      }),
+    }
+  );
+  const decoded = decodePaymentHeader(result.xPayment);
+
+  assert.equal(result.paymentIdentifier, 'anchora_20260430_00112233445566778899aabb');
+  assert.equal(decoded.payload.transaction, 'signed-inline-transaction');
+  assert.equal(result.walletRecord.ledger.spentAtomic, '50000');
+  assert.equal(result.walletRecord.ledger.payments.length, 1);
+  assert.equal(result.walletRecord.secretKey.length, 64);
+  assert.match(result.secretHandling.warning, /secret-bearing/);
 });
 
 test('buildContextPlan returns bridge-fetchable Solana RPC context URLs', async () => {

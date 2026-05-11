@@ -8,7 +8,7 @@ Use this repository as the canonical command workspace for agent-side x402 testi
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.0` or newer:
+Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.1` or newer:
 
 ```bash
 git pull --ff-only
@@ -16,7 +16,7 @@ npm ci
 node -p "require('./package.json').version"
 ```
 
-Older copies may fetch the protected route directly or try to redeem before settlement in bridges that intercept HTTP `402`. The current flow uses `/api/x402/v1/quote` first and includes a bridge-safe facilitator-settle path.
+Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, or fall back to manual REPL signing in read-only sandboxes. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, and supports filesystem-free in-memory signing.
 
 ## What This Does
 
@@ -27,6 +27,7 @@ Older copies may fetch the protected route directly or try to redeem before sett
 - Signs a Solana USDC payment only when the quote matches policy.
 - Retries the same Anchora URL with `X-PAYMENT` in transparent HTTP clients.
 - Emits a `facilitatorSettle` request for bridges that intercept HTTP `402`.
+- Supports `create-in-memory` and `sign-x402-stdin` when no wallet directory is writable.
 - Returns the proof-package response and settlement transaction.
 
 Current public judge/testing contour:
@@ -93,6 +94,27 @@ If the current workspace is read-only, create the wallet in a writable temp dire
 ```bash
 wallet_dir="$(mktemp -d)"
 npm run x402:wallet -- create --wallet default --wallet-dir "$wallet_dir" --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
+```
+
+If no filesystem location is writable, use the in-memory path instead of manual Node REPL signing:
+
+```bash
+npm run x402:wallet -- create-in-memory --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
+```
+
+This prints an ephemeral `walletRecord` that contains a generated low-balance secret key. Keep it inside the agent runtime only, never show it to the user, and use it only for the authorized Anchora policy. After funding the printed public key, sign without filesystem state by passing that record and the saved `signerRequest`:
+
+```bash
+npm run x402:wallet -- sign-x402-stdin < inline-wallet-sign-request.json
+```
+
+`inline-wallet-sign-request.json` shape:
+
+```json
+{
+  "walletRecord": { "...": "walletRecord from create-in-memory" },
+  "signerRequest": { "...": "signerRequest from offline-context-plan" }
+}
 ```
 
 Show the printed public key to the user. The user should fund only that public key with:
@@ -186,11 +208,13 @@ npm run x402:agent -- \
 
 Do not pay through the bridge wallet. The bridge should never receive the local wallet secret.
 
-Do not run a separate facilitator pre-verify in restricted bridge mode. It can make the blockhash expire before the paid retry. Retry only if Anchora returns a structured pre-send error such as `blockhash_expired` with `phase: "verify"` or `phase: "build"` and `retryable: true`. If Anchora returns `settlement_pending` with `checkTransaction`, do not re-sign or repay; check the status first:
+Do not run a separate facilitator pre-verify in restricted bridge mode. It can make the blockhash expire before the paid retry. Retry only if Anchora returns a structured `blockhash_expired` error with `retryable: true` and no `checkTransaction`. If Anchora returns `settlement_pending` with `checkTransaction`, do not re-sign or repay; check the status first:
 
 ```bash
 npm run x402:agent -- --check-payment <payment_identifier>
 ```
+
+Facilitator-settle technical failures intentionally return structured non-402 responses (`409` for retryable `blockhash_expired`, `502` for pending or failed settlement) so x402-aware bridges expose the body instead of treating it as a new payment challenge.
 
 ## Installable Skill
 

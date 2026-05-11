@@ -967,10 +967,12 @@ function printHelp() {
 
 Usage:
   npm run x402:wallet -- create --wallet default
+  npm run x402:wallet -- create-in-memory --domain anchora.markets
   npm run x402:wallet -- create --wallet default --wallet-dir "$TMPDIR/anchora-agent-wallets"
   npm run x402:wallet -- info --wallet default
   npm run x402:wallet -- balance --wallet default
   npm run x402:wallet -- sign-x402 --wallet default
+  npm run x402:wallet -- sign-x402-stdin < inline-wallet-sign-request.json
 
 Create defaults:
   domain: anchora.markets
@@ -980,7 +982,12 @@ Create defaults:
   network: ${DEFAULT_X402_NETWORK}
 
 The sign-x402 command reads a signer request JSON from stdin and returns JSON on stdout.
-It never prints the wallet secret key.`);
+It never prints the wallet secret key.
+
+The create-in-memory and sign-x402-stdin commands are for restricted sandboxes
+where filesystem writes are unavailable. Their JSON includes a generated
+low-balance wallet secret in walletRecord; do not print it in chat, commit it,
+or reuse it outside the authorized Anchora x402 policy.`);
 }
 
 function isWritableLocationError(error) {
@@ -1059,6 +1066,46 @@ async function runCreate(args) {
   };
 }
 
+async function runCreateInMemory(args) {
+  const record = await createWalletRecord({
+    name: String(args.wallet ?? args.name ?? DEFAULT_WALLET_NAME),
+    domain: String(args.domain ?? DEFAULT_DOMAIN),
+    perRequestAtomic: args['per-request-atomic']
+      ? String(args['per-request-atomic'])
+      : usdcToAtomicString(args['per-request-usdc'] ?? '0.30'),
+    dailyAtomic: args['daily-atomic']
+      ? String(args['daily-atomic'])
+      : usdcToAtomicString(args['daily-usdc'] ?? '1'),
+    rpcUrl: String(args['rpc-url'] ?? process.env.X402_SOLANA_RPC_URL ?? DEFAULT_RPC_URL),
+    payTo: String(args['pay-to'] ?? process.env.X402_SOLANA_PAY_TO ?? DEFAULT_PAY_TO),
+    usdcMint: String(args['usdc-mint'] ?? process.env.X402_SOLANA_USDC_MINT ?? DEFAULT_USDC_MINT),
+    network: args.network ?? process.env.ANCHORA_X402_NETWORK ?? process.env.X402_SOLANA_NETWORK,
+    simulateBeforeSign: args['no-simulate'] !== true,
+  });
+
+  return {
+    ok: true,
+    created: true,
+    ephemeral: true,
+    walletRecord: record,
+    wallet: formatWalletInfo(record),
+    secretHandling: {
+      warning:
+        'walletRecord contains the generated low-balance wallet secret. Keep it in local agent memory only; do not show it to the user, commit it, or reuse it outside this Anchora x402 policy.',
+      recommendedNextCommand:
+        'Use sign-x402-stdin with { "walletRecord": <walletRecord>, "signerRequest": <signerRequest> } when filesystem writes are unavailable.',
+    },
+    funding: {
+      sendTo: record.address,
+      recommendedUsdc: '1 USDC',
+      recommendedSol: '0.01 SOL',
+      usdcMint: record.policy.allowedUsdcMint,
+      note:
+        'Fund this public address only. The secret is present in walletRecord for restricted in-memory signing and must stay local to the agent runtime.',
+    },
+  };
+}
+
 async function runInfo(args) {
   const record = loadWalletRecord(String(args.wallet ?? DEFAULT_WALLET_NAME), resolveWalletDir(args['wallet-dir']));
   return {
@@ -1083,6 +1130,40 @@ async function runSignX402(args) {
   const response = await signX402Request({ walletRecord: record, request });
   saveWalletRecord(record, walletDir);
   return response;
+}
+
+export async function signX402WithInlineWallet(input, options = {}) {
+  const record = input?.walletRecord ?? input?.wallet ?? input?.agentWalletRecord;
+  const request = input?.signerRequest ?? input?.request;
+  const validation = validateWalletRecord(record);
+  if (!validation.ok) {
+    throw new AgentWalletError('Inline wallet record is invalid', validation.errors);
+  }
+  if (!request || typeof request !== 'object') {
+    throw new AgentWalletError('Inline signerRequest is required');
+  }
+
+  if (options.noSimulate === true) record.policy.simulateBeforeSign = false;
+  const response = await signX402Request({
+    walletRecord: record,
+    request,
+    now: options.now ?? new Date(),
+    paymentBuilder: options.paymentBuilder ?? buildSolanaExactPaymentPayload,
+  });
+
+  return {
+    ...response,
+    walletRecord: record,
+    secretHandling: {
+      warning:
+        'walletRecord remains secret-bearing and includes the updated local spend ledger. Keep it local and use it for any same-session follow-up status/signing work.',
+    },
+  };
+}
+
+async function runSignX402Stdin(args) {
+  const input = JSON.parse(await readStdin());
+  return signX402WithInlineWallet(input, { noSimulate: args['no-simulate'] === true });
 }
 
 async function runContextPlan(args) {
@@ -1113,9 +1194,13 @@ async function main() {
 
   let result;
   if (command === 'create') result = await runCreate(args);
+  else if (command === 'create-in-memory') result = await runCreateInMemory(args);
   else if (command === 'info') result = await runInfo(args);
   else if (command === 'balance') result = await runBalance(args);
   else if (command === 'sign-x402') result = await runSignX402(args);
+  else if (command === 'sign-x402-stdin' || command === 'sign-only') {
+    result = await runSignX402Stdin(args);
+  }
   else if (command === 'context-plan') result = await runContextPlan(args);
   else throw new AgentWalletError(`Unknown command "${command}"`);
 
