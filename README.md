@@ -8,13 +8,13 @@ Use this repository as the canonical command workspace for agent-side x402 testi
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.3` or newer:
+Before executing payments, use helper version `0.4.5` or newer:
 
 ```bash
-git pull --ff-only
-npm ci
 node -p "require('./package.json').version"
 ```
+
+If an existing local workspace already reports `0.4.5` or newer, do not `git pull`, clone, or run `npm ci` just to create a wallet. Refresh only when the version is too old, the helper command fails, or the user explicitly asks for the newest helper.
 
 Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, fall back to manual REPL signing in read-only sandboxes, or spend time inspecting the private Anchora repo for a payment-only task. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, supports filesystem-free in-memory signing, and has a strict fast path for agent payments.
 
@@ -41,7 +41,7 @@ Current public judge/testing contour:
 | Demo asset PDA | `2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX` |
 | Proof snapshot price | `0.30 test USDC` |
 
-Always prefer the live catalog as source of truth:
+The live catalog is the source of truth for route pricing and settlement policy. The payment command reads it internally. Use the standalone catalog command only for explicit audit/debug mode:
 
 ```bash
 npm run catalog
@@ -57,7 +57,18 @@ If this helper repo is already available locally, use it directly. Preferred reu
 $HOME/.codex/anchora-x402-agent
 ```
 
-Do not clone once into a temporary directory and then clone again into a stable directory. Pick the stable workspace first, run `git pull --ff-only` or a shallow fetch there, then continue.
+Do not clone once into a temporary directory and then clone again into a stable directory. Pick the stable workspace first. If it already reports version `0.4.5` or newer, continue without pulling or reinstalling.
+
+Fastest wallet setup path:
+
+```bash
+cd "$HOME/.codex/anchora-x402-agent"
+node -p "require('./package.json').version"
+test -d node_modules/@solana/kit || npm ci
+npm run x402:wallet:ensure
+```
+
+Do not check `node_modules/.bin/tsx`; this helper does not depend on `tsx`. Do not use timestamped wallet names for the normal flow. `x402:wallet:ensure` creates or reuses `default` and prints the public funding address.
 
 Fastest happy path after the wallet exists, is funded, and the user has authorized the local policy:
 
@@ -100,19 +111,25 @@ curl -fsS 'https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_a
 ## Quick Start
 
 ```bash
-git clone https://github.com/Marakaya/anchora-x402-agent
-cd anchora-x402-agent
-npm ci
-npm run catalog
+mkdir -p "$HOME/.codex"
+if [ ! -d "$HOME/.codex/anchora-x402-agent/.git" ]; then
+  git clone --depth 1 https://github.com/Marakaya/anchora-x402-agent "$HOME/.codex/anchora-x402-agent"
+fi
+cd "$HOME/.codex/anchora-x402-agent"
+node -p "require('./package.json').version"
+test -d node_modules/@solana/kit || npm ci
+npm run x402:wallet:ensure
 ```
 
-If you only need to create or reuse the local payment wallet, use the idempotent command:
+This is the normal first step for an agent wallet: it creates or reuses the local `default` wallet and prints the public funding address. Do not run `npm run catalog` just to create the wallet.
+
+If you are already inside a prepared helper workspace, the wallet command is simply:
 
 ```bash
 npm run x402:wallet:ensure
 ```
 
-It creates `default` when missing and reuses it when the existing wallet already matches the Anchora policy. It prints the public funding address without exposing the secret. Do not wrap it in custom shell code or use a variable named `status` in zsh.
+It creates `default` when missing and reuses it when the existing wallet already matches the Anchora policy. It prints the public funding address without exposing the secret. Do not wrap it in custom shell code, do not use a variable named `status` in zsh, and do not generate timestamped wallet names unless you explicitly need a fresh isolated wallet.
 
 No Git available:
 
@@ -121,8 +138,8 @@ tmp_dir="$(mktemp -d)"
 curl -fsSL https://codeload.github.com/Marakaya/anchora-x402-agent/tar.gz/refs/heads/main \
   | tar -xz --strip-components=1 -C "$tmp_dir"
 cd "$tmp_dir"
-npm ci
-npm run catalog
+test -d node_modules/@solana/kit || npm ci
+npm run x402:wallet:ensure
 ```
 
 ## Fast pay.sh Smoke
