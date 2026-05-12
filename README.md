@@ -72,12 +72,14 @@ npm run x402:proof -- \
 
 The proof command performs catalog discovery, quote validation, payment signing, settlement, and redeem in one run. Do not split it into separate catalog and dry-run commands unless the user asked for an audit log, the wallet policy has not been authorized, or the command fails.
 
-Allowed discovery before payment:
+Allowed discovery before payment only when setting up the helper, debugging, or producing an explicit audit log:
 
 - `node -p "require('./package.json').version"`
 - `npm run catalog`
 - `GET /quote`
 - wallet balance or signing-context checks
+
+After the user has funded the wallet and already authorized the local policy, do not run a separate catalog command or dry-run quote validation. Execute the single proof command; it performs catalog and quote validation internally before signing.
 
 Only inspect helper source or project code after two consecutive failures from the same helper command or an undocumented response shape from Anchora. If filesystem writes fail, switch directly to `create-in-memory`; do not try `.anchora`, `mktemp`, and manual Node REPL signing in sequence.
 
@@ -243,6 +245,8 @@ npm run x402:agent -- \
   --agent-wallet default
 ```
 
+Use this only for explicit audit/review mode or when the user has not authorized the bounded policy. Do not run it before the single-call payment command in the funded happy path.
+
 The local wallet refuses wrong domain, wrong route prefix, wrong Solana x402 network, wrong USDC mint, wrong recipient, over-cap amount, over daily cap, and missing `payment-identifier`.
 
 ## No-direct-network fallback
@@ -330,7 +334,7 @@ Create a dedicated Anchora x402 agent wallet with:
 - per request cap: 0.30 USDC
 - daily cap: 1 USDC
 
-Show me only the generated public key so I can fund it with devnet SOL and devnet USDC. After I confirm funding, read the catalog, validate the quote, execute payment only if it matches policy, and return the proof-package summary with the settlement transaction.
+Show me only the generated public key so I can fund it with devnet SOL and devnet USDC. After I confirm funding, run the single proof command; it validates catalog and quote internally before signing. Return the proof-package summary with the settlement transaction.
 
 Do not ask for my seed phrase, raw private key, or existing keypair JSON.
 ```
