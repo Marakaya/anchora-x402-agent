@@ -9,7 +9,7 @@ Anchora sells machine-readable trust for real-world assets. Use the x402 rail wh
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.4.2` or newer. Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, fall back to manual REPL signing in read-only sandboxes, or spend time inspecting the private Anchora repo for a payment-only task. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, supports filesystem-free in-memory signing, and has a strict fast path for agent payments.
+Before executing payments, refresh this helper workspace or skill from `https://github.com/Marakaya/anchora-x402-agent` and use version `0.4.3` or newer. Older copies may fetch the protected route directly, try to redeem before settlement in bridges that intercept HTTP `402`, fall back to manual REPL signing in read-only sandboxes, or spend time inspecting the private Anchora repo for a payment-only task. The current flow uses `/api/x402/v1/quote` first, includes a bridge-safe facilitator-settle path, supports filesystem-free in-memory signing, and has a strict fast path for agent payments.
 
 Current production-facing settlement is server-side and declared in `/api/x402/v1/catalog`. Anchora may use Coinbase CDP or `direct-solana` proof mode. In a transparent HTTP client, the agent checks `settlement.ready`, calls Anchora, receives a quote, signs a Solana USDC payment through a bounded signer, retries Anchora with `X-PAYMENT`, and Anchora verifies/settles server-side. In a bridge that intercepts HTTP `402`, the agent uses the helper's returned `facilitatorSettle` body first, then redeems the same target URL with the same `X-PAYMENT`.
 
@@ -32,7 +32,7 @@ Target timing:
 
 - already funded wallet: one catalog/quote/sign/settle/redeem pass
 - new wallet: show public key, wait for user funding, then one payment pass
-- hostile bridge/no-direct-network: use `/quote`, one signing-context request, `sign-x402-stdin`, facilitator-settle, status check, redeem
+- hostile bridge/no-direct-network: use `/quote`, one signing-context request, `--bridge-sign-stdin` or `ANCHORA_X402_BRIDGE_SIGN_INPUT_B64`, facilitator-settle, status check, redeem
 
 ## Safety Rules
 
@@ -154,6 +154,33 @@ npm run x402:wallet -- sign-x402-stdin < inline-wallet-sign-request.json
 }
 ```
 
+For bridge/no-direct-network proof-package payment, prefer the runner's combined bridge signing entrypoint instead of `offline-context-plan`, `/dev/fd`, heredocs, `node -e`, or Node REPL:
+
+```bash
+printf '%s' "$BRIDGE_SIGN_INPUT_JSON" \
+  | npm run x402:agent -- --bridge-sign-stdin --asset-address <asset_pda> --payment-identifier <same_payment_identifier> --json
+```
+
+If stdin, heredocs, or temporary files are unavailable, base64-encode the same JSON and use:
+
+```bash
+ANCHORA_X402_BRIDGE_SIGN_INPUT_B64="$BRIDGE_SIGN_INPUT_B64" \
+  npm run x402:agent -- --bridge-sign-env --asset-address <asset_pda> --payment-identifier <same_payment_identifier> --json
+```
+
+`BRIDGE_SIGN_INPUT_JSON` shape:
+
+```json
+{
+  "walletRecord": { "...": "walletRecord from create-in-memory" },
+  "quoteBody": { "...": "200 JSON body from /api/x402/v1/quote" },
+  "solanaContext": { "...": "JSON body from /api/x402/solana-rpc?method=signing-context&payer=<public_key>" },
+  "paymentIdentifier": "anchora_YYYYMMDD_..."
+}
+```
+
+The command returns the `X-PAYMENT` header, `facilitatorSettle.body`, `paymentStatus.url`, and updated secret-bearing `walletRecord` in one result. Keep the updated walletRecord inside the agent runtime only.
+
 Tell the user to fund the printed public key with:
 
 ```text
@@ -189,20 +216,28 @@ GET https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_address=
 
 3. If `/quote` works, do not fetch the protected route without `X-PAYMENT`. Some bridges intercept HTTP `402` and swallow the quote body.
 4. If `/quote` is unavailable, fetch the protected route without `X-PAYMENT` through a transparent HTTP client only, then save the `402` JSON body as `quote.json`.
-5. Build an offline context plan:
+5. Fetch signing context once through the bridge, immediately before signing:
+
+```text
+GET https://anchora.markets/api/x402/solana-rpc?method=signing-context&payer=<agent_wallet_public_key>
+```
+
+6. Run the combined bridge signer with `{ walletRecord, quoteBody, solanaContext, paymentIdentifier }` through `--bridge-sign-stdin` or `ANCHORA_X402_BRIDGE_SIGN_INPUT_B64`. Do not use `/dev/fd`, heredocs, temporary files, `node -e`, or Node REPL unless this helper command itself fails twice.
+
+Legacy file-based fallback if the combined signer is unavailable:
 
 ```bash
 npm run x402:agent -- --offline-context-plan --quote-file quote.json --asset-address <asset_pda> --agent-wallet default
 ```
 
-6. Save the returned `signerRequest` as `signer-request.json`.
-7. Run:
+7. Save the returned `signerRequest` as `signer-request.json`.
+8. Run:
 
 ```bash
 npm run x402:wallet -- context-plan --wallet default < signer-request.json
 ```
 
-8. Prefer the returned `fetchContextWithBridge.url`. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
+9. Prefer the returned `fetchContextWithBridge.url`. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
 
 If your environment cannot use the one-call context URL, fetch every `fetchWithBridge[].url` through the bridge instead. Fetch `latestBlockhash` last, immediately before signing. Save `solana-context.json` as:
 
@@ -215,14 +250,14 @@ If your environment cannot use the one-call context URL, fetch every `fetchWithB
 }
 ```
 
-9. Sign locally with the same `paymentIdentifier` from the offline context plan:
+10. Sign locally with the same `paymentIdentifier` from the offline context plan:
 
 ```bash
 npm run x402:agent -- --offline-sign --quote-file quote.json --solana-context-file solana-context.json --asset-address <asset_pda> --agent-wallet default --payment-identifier <same_payment_identifier>
 ```
 
-10. If your bridge is transparent to `402`, retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward it verbatim; do not parse, edit, or rebuild it.
-11. If your bridge intercepts `402`, POST the helper's returned `facilitatorSettle.body` to `facilitatorSettle.url`, then check `paymentStatus.url` until `status: "settled"`, then GET the target URL with the same `X-PAYMENT` header to redeem the response.
+11. If your bridge is transparent to `402`, retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward it verbatim; do not parse, edit, or rebuild it.
+12. If your bridge intercepts `402`, POST the helper's returned `facilitatorSettle.body` to `facilitatorSettle.url`, then check `paymentStatus.url` until `status: "settled"`, then GET the target URL with the same `X-PAYMENT` header to redeem the response.
 
 This keeps the dedicated Anchora wallet as payer. The bridge transports HTTP/RPC data only; it must not create or fund the payment.
 

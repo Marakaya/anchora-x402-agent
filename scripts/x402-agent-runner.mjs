@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { signX402WithInlineWallet } from './x402-agent-wallet.mjs';
 
 export const DEFAULT_SITE_URL = 'https://anchora.markets';
 export const DEFAULT_PAY_TO = 'DtWRumAEkL4AHfSwphuHf2RTmC2zJ9qP2wmGjtq4FxLP';
@@ -170,6 +171,13 @@ export function buildConfig(argv = process.argv.slice(2), env = process.env) {
     offlineContextPlan:
       args['offline-context-plan'] === true ||
       env.ANCHORA_X402_OFFLINE_CONTEXT_PLAN === 'true',
+    bridgeSignStdin:
+      args['bridge-sign-stdin'] === true ||
+      args['bridge-sign-env'] === true ||
+      env.ANCHORA_X402_BRIDGE_SIGN_STDIN === 'true',
+    bridgeSignInputB64: optionalString(
+      args['bridge-sign-input-b64'] ?? env.ANCHORA_X402_BRIDGE_SIGN_INPUT_B64
+    ),
     checkPayment: optionalString(args['check-payment'] ?? env.ANCHORA_X402_CHECK_PAYMENT),
     quoteFile: optionalString(args['quote-file'] ?? env.ANCHORA_X402_QUOTE_FILE),
     solanaContextFile: optionalString(args['solana-context-file'] ?? env.ANCHORA_X402_SOLANA_CONTEXT_FILE),
@@ -521,6 +529,10 @@ export async function runAgentPayment(config) {
     return runOfflineAgentPayment(config, targetUrl);
   }
 
+  if (config.bridgeSignStdin || config.bridgeSignInputB64) {
+    return runBridgeSignPayment(config, targetUrl);
+  }
+
   if (config.route === 'catalog') {
     const { catalogBody, catalogResponse } = await fetchCatalog(config);
 
@@ -803,6 +815,96 @@ export async function runOfflineAgentPayment(config, targetUrl = buildTargetUrl(
   };
 }
 
+export async function runBridgeSignPayment(config, targetUrl = buildTargetUrl(config)) {
+  if (config.route === 'catalog') {
+    throw new AgentRunnerError('Bridge signing is only for paid x402 routes, not catalog');
+  }
+
+  const input = await readJsonInput({
+    stdin: config.bridgeSignStdin,
+    base64: config.bridgeSignInputB64,
+    label: '--bridge-sign-stdin or ANCHORA_X402_BRIDGE_SIGN_INPUT_B64',
+  });
+  const walletRecord = input.walletRecord ?? input.wallet ?? input.agentWalletRecord;
+  const quoteBody = input.quoteBody ?? input.quote;
+  const solanaContext = input.solanaContext ?? input.context ?? null;
+  const paymentIdentifier = input.paymentIdentifier || config.paymentIdentifier || buildPaymentIdentifier();
+
+  if (!walletRecord || typeof walletRecord !== 'object') {
+    throw new AgentRunnerError('Bridge sign input must include walletRecord');
+  }
+  if (!quoteBody || typeof quoteBody !== 'object') {
+    throw new AgentRunnerError('Bridge sign input must include quoteBody');
+  }
+  if (!solanaContext || typeof solanaContext !== 'object') {
+    throw new AgentRunnerError('Bridge sign input must include solanaContext from /api/x402/solana-rpc?method=signing-context');
+  }
+
+  const requirement = selectPaymentRequirement(quoteBody);
+  if (!requirement) {
+    throw new AgentRunnerError('No Solana exact payment requirement found in bridge quote');
+  }
+
+  const validation = validatePaymentRequirement(requirement, {
+    expectedUrl: targetUrl,
+    expectedPayTo: config.expectedPayTo,
+    expectedUsdcMint: config.expectedUsdcMint,
+    expectedNetwork: config.expectedNetwork,
+    maxAtomicAmount: config.maxAtomicAmount,
+  });
+  if (!validation.ok) {
+    throw new AgentRunnerError('Bridge payment requirement failed local policy checks', validation.errors);
+  }
+
+  const signerPayload = buildSignerRequest({
+    config,
+    quoteBody,
+    requirement,
+    targetUrl,
+    paymentIdentifier,
+    solanaContext,
+  });
+  const signerResponse = await signX402WithInlineWallet(
+    { walletRecord, signerRequest: signerPayload },
+    { noSimulate: input.noSimulate === true }
+  );
+  const { xPayment, payerAddress } = normalizeSignerResponse(signerResponse, paymentIdentifier);
+  const facilitatorSettleBody = buildFacilitatorSettleRequest(xPayment, requirement);
+
+  return {
+    ok: true,
+    dryRun: false,
+    bridgeSign: true,
+    targetUrl,
+    route: config.route,
+    policy: config.route === 'proof-package' ? config.policy : null,
+    payerAddress,
+    paymentIdentifier,
+    headers: { 'X-PAYMENT': xPayment },
+    facilitatorSettle: {
+      url: buildFacilitatorSettleUrl(config),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: facilitatorSettleBody,
+    },
+    paymentStatus: {
+      url: buildPaymentStatusUrl(config, paymentIdentifier),
+      method: 'GET',
+    },
+    walletRecord: signerResponse.walletRecord,
+    secretHandling: {
+      warning:
+        'walletRecord is still secret-bearing and now includes the updated spend ledger. Keep it inside the agent runtime; do not print it to the user.',
+    },
+    next: [
+      'POST facilitatorSettle.body to facilitatorSettle.url.',
+      'GET paymentStatus.url until status is settled.',
+      'GET targetUrl with the same X-PAYMENT header to redeem the paid response.',
+      'If Anchora returns blockhash_expired with retryable true before send, fetch fresh signing context and rerun bridge signing once with the same paymentIdentifier.',
+    ],
+  };
+}
+
 function readJsonFile(path) {
   try {
     return JSON.parse(readFileSync(path, 'utf8'));
@@ -811,6 +913,33 @@ function readJsonFile(path) {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+async function readJsonInput({ stdin = false, base64 = null, label = 'JSON input' } = {}) {
+  let raw = null;
+  if (base64) {
+    raw = Buffer.from(String(base64), 'base64').toString('utf8');
+  } else if (stdin) {
+    raw = await readStdin();
+  }
+
+  if (!raw || !raw.trim()) {
+    throw new AgentRunnerError(`${label} is required`);
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new AgentRunnerError(`Could not parse ${label} as JSON`, {
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8').trim();
 }
 
 async function readJsonOrText(response) {
@@ -1028,6 +1157,7 @@ Usage:
   npm run x402:agent -- --route investor-report --asset-address <asset_pda>
   npm run x402:agent -- --asset-address <asset_pda> --execute-payment
   npm run x402:agent -- --check-payment <payment_identifier>
+  npm run x402:agent -- --bridge-sign-stdin --asset-address <asset_pda> < bridge-sign-input.json
 
 Environment:
   ANCHORA_X402_SIGNER_URL       HTTPS signer endpoint; /v1/x402/sign is appended for bare origins
@@ -1039,6 +1169,9 @@ Environment:
   ANCHORA_X402_OFFLINE_SIGN     Sign from a saved 402 quote/context without local network fetches
   ANCHORA_X402_OFFLINE_CONTEXT_PLAN
                                   Build a restricted-network signer request and bridge context plan
+  ANCHORA_X402_BRIDGE_SIGN_STDIN  Sign bridge-fetched quote/context JSON from stdin
+  ANCHORA_X402_BRIDGE_SIGN_INPUT_B64
+                                  Base64 JSON input for bridge signing when stdin/heredocs are unavailable
   ANCHORA_X402_CHECK_PAYMENT     Read payment status by payment-identifier without x402
   ANCHORA_X402_QUOTE_FILE       Saved 402 JSON quote used by offline signing
 

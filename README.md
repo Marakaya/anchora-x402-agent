@@ -8,7 +8,7 @@ Use this repository as the canonical command workspace for agent-side x402 testi
 
 ## Version Guard
 
-Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.2` or newer:
+Before executing payments, refresh this helper workspace or skill from the public repo and use version `0.4.3` or newer:
 
 ```bash
 git pull --ff-only
@@ -65,7 +65,7 @@ Expected hostile-environment path:
 1. Create an in-memory wallet.
 2. Ask the user to fund the printed public key.
 3. Fetch `/catalog`, `/quote`, and signing context through the bridge.
-4. Sign with `sign-x402-stdin`.
+4. Sign with `--bridge-sign-stdin` or `ANCHORA_X402_BRIDGE_SIGN_INPUT_B64`.
 5. POST `facilitatorSettle.body`, check payment status, then redeem the target URL.
 
 Bridge-safe quote endpoint:
@@ -138,6 +138,33 @@ npm run x402:wallet -- sign-x402-stdin < inline-wallet-sign-request.json
 }
 ```
 
+For bridge/no-direct-network proof-package payment, prefer the runner's combined bridge signing entrypoint instead of `offline-context-plan`, `/dev/fd`, heredocs, `node -e`, or Node REPL:
+
+```bash
+printf '%s' "$BRIDGE_SIGN_INPUT_JSON" \
+  | npm run x402:agent -- --bridge-sign-stdin --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX --payment-identifier <same_payment_identifier> --json
+```
+
+If stdin, heredocs, or temporary files are unavailable, base64-encode the same JSON and use:
+
+```bash
+ANCHORA_X402_BRIDGE_SIGN_INPUT_B64="$BRIDGE_SIGN_INPUT_B64" \
+  npm run x402:agent -- --bridge-sign-env --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX --payment-identifier <same_payment_identifier> --json
+```
+
+`BRIDGE_SIGN_INPUT_JSON` shape:
+
+```json
+{
+  "walletRecord": { "...": "walletRecord from create-in-memory" },
+  "quoteBody": { "...": "200 JSON body from /api/x402/v1/quote" },
+  "solanaContext": { "...": "JSON body from /api/x402/solana-rpc?method=signing-context&payer=<public_key>" },
+  "paymentIdentifier": "anchora_YYYYMMDD_..."
+}
+```
+
+The command returns the `X-PAYMENT` header, `facilitatorSettle.body`, `paymentStatus.url`, and updated secret-bearing `walletRecord` in one result. Keep the updated walletRecord inside the agent runtime only.
+
 Show the printed public key to the user. The user should fund only that public key with:
 
 ```text
@@ -192,7 +219,15 @@ GET https://anchora.markets/api/x402/v1/quote?route=proof-package&asset_address=
 If `/quote` works, do not fetch the protected route without `X-PAYMENT`. Some bridges intercept HTTP `402` and swallow the quote body.
 
 3. If `/quote` is unavailable, fetch the target route without `X-PAYMENT` through a transparent HTTP client only, then save the `402` body as `quote.json`.
-4. Build an offline plan:
+4. Fetch signing context once through the bridge, immediately before signing:
+
+```text
+GET https://anchora.markets/api/x402/solana-rpc?method=signing-context&payer=<agent_wallet_public_key>
+```
+
+5. Run the combined bridge signer with `{ walletRecord, quoteBody, solanaContext, paymentIdentifier }` through `--bridge-sign-stdin` or `ANCHORA_X402_BRIDGE_SIGN_INPUT_B64`. Do not use `/dev/fd`, heredocs, temporary files, `node -e`, or Node REPL unless this helper command itself fails twice.
+
+Legacy file-based fallback if the combined signer is unavailable:
 
 ```bash
 npm run x402:agent -- \
@@ -202,17 +237,17 @@ npm run x402:agent -- \
   --agent-wallet default
 ```
 
-5. Save `signerRequest` from the output as `signer-request.json`, then run:
+6. Save `signerRequest` from the output as `signer-request.json`, then run:
 
 ```bash
 npm run x402:wallet -- context-plan --wallet default < signer-request.json
 ```
 
-6. Prefer `fetchContextWithBridge.url` from the wallet context-plan output. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
+7. Prefer `fetchContextWithBridge.url` from the wallet context-plan output. Fetch that one URL through the bridge immediately before signing and save the response as `solana-context.json`.
 
 If the one-call URL is unavailable, fetch every `fetchWithBridge[].url` instead and fetch `latestBlockhash` last, immediately before signing.
 
-7. Sign locally:
+8. Sign locally:
 
 ```bash
 npm run x402:agent -- \
@@ -224,8 +259,8 @@ npm run x402:agent -- \
   --payment-identifier <same_payment_identifier>
 ```
 
-8. If the bridge is transparent to `402`, retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward the helper-produced header verbatim; do not parse, edit, or rebuild it.
-9. If the bridge intercepts `402`, POST the returned `facilitatorSettle.body` to `facilitatorSettle.url`, then check `paymentStatus.url` until `status: "settled"`, then GET the target URL with the same `X-PAYMENT` header to redeem the response.
+9. If the bridge is transparent to `402`, retry the exact target URL through the bridge with the returned `X-PAYMENT` header. Forward the helper-produced header verbatim; do not parse, edit, or rebuild it.
+10. If the bridge intercepts `402`, POST the returned `facilitatorSettle.body` to `facilitatorSettle.url`, then check `paymentStatus.url` until `status: "settled"`, then GET the target URL with the same `X-PAYMENT` header to redeem the response.
 
 Do not pay through the bridge wallet. The bridge should never receive the local wallet secret.
 

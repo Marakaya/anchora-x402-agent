@@ -17,6 +17,7 @@ import {
   normalizeSignerResponse,
   resolveSignerUrl,
   runAgentPayment,
+  runBridgeSignPayment,
   runOfflineAgentPayment,
   selectPaymentRequirement,
   validatePaymentRequirement,
@@ -601,6 +602,27 @@ test('runOfflineAgentPayment returns bridge-safe facilitator settle instructions
     'https://anchora.markets/api/x402/v1/payments/anchora_20260430_00112233445566778899aabb/status'
   );
   assert.equal(Array.isArray(result.next), true);
+});
+
+test('runBridgeSignPayment accepts base64 input and fails before signing when walletRecord is missing', async () => {
+  const targetUrl = `https://anchora.markets/api/x402/v1/assets/${ASSET_ADDRESS}/proof-package?policy=collateral_screening`;
+  const input = Buffer.from(
+    JSON.stringify({
+      quoteBody: { x402Version: 1, accepts: [validRequirement(targetUrl)] },
+      solanaContext: { latestBlockhash: { value: { blockhash: 'blockhash' } } },
+    })
+  ).toString('base64');
+  const config = baseConfig({
+    argv: ['--bridge-sign-input-b64', input],
+  });
+
+  await assert.rejects(
+    () => runBridgeSignPayment(config),
+    error => {
+      assert.match(error.message, /walletRecord/);
+      return true;
+    }
+  );
 });
 
 test('runAgentPayment refuses to sign when catalog settlement is not ready', async () => {
