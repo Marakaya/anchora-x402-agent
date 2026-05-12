@@ -21,12 +21,16 @@ cd "$HOME/.codex/anchora-x402-agent" 2>/dev/null \
   && npm --silent run x402:wallet:ensure
 ```
 
+If this fails because `$HOME/.codex/anchora-x402-agent` is missing, continue to **Quick Start** below, install the helper once into that stable path, then rerun only this command.
+
 - If the user explicitly asks for a fresh/new/isolated wallet, skip `ensure` and create one fresh wallet directly:
 
 ```bash
 cd "$HOME/.codex/anchora-x402-agent" \
   && npm --silent run x402:wallet -- create --wallet "fresh-$(date +%Y%m%d%H%M%S)" --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
 ```
+
+If this fails because `$HOME/.codex/anchora-x402-agent` is missing, continue to **Quick Start** below, install the helper once into that stable path, then rerun only this command.
 
 An existing `default` wallet with `spentToday: 0.3 USDC` and `dailyCap: 1 USDC` still has enough capacity for another `0.30 USDC` proof-package call; do not create a second wallet unless the user requested it. Return only the public funding address and no secret fields.
 
