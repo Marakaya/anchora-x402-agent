@@ -967,6 +967,7 @@ function printHelp() {
 
 Usage:
   npm run x402:wallet -- create --wallet default
+  npm run x402:wallet -- ensure --wallet default
   npm run x402:wallet -- create-in-memory --domain anchora.markets
   npm run x402:wallet -- create --wallet default --wallet-dir "$TMPDIR/anchora-agent-wallets"
   npm run x402:wallet -- info --wallet default
@@ -1016,16 +1017,9 @@ function saveWalletRecordWithFallback(record, walletDir, args) {
   }
 }
 
-async function runCreate(args) {
-  const name = String(args.wallet ?? args.name ?? DEFAULT_WALLET_NAME);
-  const walletDir = resolveWalletDir(args['wallet-dir']);
-  const path = walletPath(name, walletDir);
-  if (existsSync(path) && args.force !== true) {
-    throw new AgentWalletError(`Agent wallet "${name}" already exists. Use --force to replace it.`);
-  }
-
-  const record = await createWalletRecord({
-    name,
+function walletOptionsFromArgs(args) {
+  return {
+    name: String(args.wallet ?? args.name ?? DEFAULT_WALLET_NAME),
     domain: String(args.domain ?? DEFAULT_DOMAIN),
     perRequestAtomic: args['per-request-atomic']
       ? String(args['per-request-atomic'])
@@ -1038,7 +1032,53 @@ async function runCreate(args) {
     usdcMint: String(args['usdc-mint'] ?? process.env.X402_SOLANA_USDC_MINT ?? DEFAULT_USDC_MINT),
     network: args.network ?? process.env.ANCHORA_X402_NETWORK ?? process.env.X402_SOLANA_NETWORK,
     simulateBeforeSign: args['no-simulate'] !== true,
+  };
+}
+
+function validateExistingWalletPolicy(record, options) {
+  const expectedOrigin = normalizeDomainOrigin(options.domain);
+  const expectedNetwork = inferX402Network({
+    explicitNetwork: options.network,
+    rpcUrl: options.rpcUrl,
+    usdcMint: options.usdcMint,
   });
+  const issues = [];
+
+  if (!record.policy.allowedOrigins.includes(expectedOrigin)) {
+    issues.push(`allowedOrigins does not include ${expectedOrigin}`);
+  }
+  if (record.policy.allowedPathPrefix !== '/api/x402/v1/') {
+    issues.push('allowedPathPrefix must be /api/x402/v1/');
+  }
+  if (record.policy.allowedPayTo !== options.payTo) {
+    issues.push('allowedPayTo differs from requested policy');
+  }
+  if (record.policy.allowedUsdcMint !== options.usdcMint) {
+    issues.push('allowedUsdcMint differs from requested policy');
+  }
+  if (record.policy.perRequestCapAtomic !== options.perRequestAtomic) {
+    issues.push('perRequestCapAtomic differs from requested policy');
+  }
+  if (record.policy.dailyCapAtomic !== options.dailyAtomic) {
+    issues.push('dailyCapAtomic differs from requested policy');
+  }
+  if (effectivePolicyNetwork(record.policy) !== expectedNetwork) {
+    issues.push('network differs from requested policy');
+  }
+
+  return issues;
+}
+
+async function runCreate(args) {
+  const options = walletOptionsFromArgs(args);
+  const name = options.name;
+  const walletDir = resolveWalletDir(args['wallet-dir']);
+  const path = walletPath(name, walletDir);
+  if (existsSync(path) && args.force !== true) {
+    throw new AgentWalletError(`Agent wallet "${name}" already exists. Use --force to replace it.`);
+  }
+
+  const record = await createWalletRecord(options);
   const saved = saveWalletRecordWithFallback(record, walletDir, args);
 
   return {
@@ -1066,22 +1106,43 @@ async function runCreate(args) {
   };
 }
 
+async function runEnsure(args) {
+  const options = walletOptionsFromArgs(args);
+  const walletDir = resolveWalletDir(args['wallet-dir']);
+  const path = walletPath(options.name, walletDir);
+
+  if (!existsSync(path) || args.force === true) {
+    return runCreate(args);
+  }
+
+  const record = loadWalletRecord(options.name, walletDir);
+  const policyIssues = validateExistingWalletPolicy(record, options);
+  if (policyIssues.length > 0) {
+    throw new AgentWalletError(
+      `Agent wallet "${options.name}" already exists with a different policy. Use --force to replace it.`,
+      policyIssues
+    );
+  }
+
+  return {
+    ok: true,
+    created: false,
+    existing: true,
+    path,
+    walletDir,
+    wallet: formatWalletInfo(record),
+    funding: {
+      sendTo: record.address,
+      recommendedUsdc: '1 USDC',
+      recommendedSol: '0.01 SOL',
+      usdcMint: record.policy.allowedUsdcMint,
+      note: 'Wallet already exists with the requested policy. Fund or reuse this public address; the secret stays in the local ignored .anchora directory.',
+    },
+  };
+}
+
 async function runCreateInMemory(args) {
-  const record = await createWalletRecord({
-    name: String(args.wallet ?? args.name ?? DEFAULT_WALLET_NAME),
-    domain: String(args.domain ?? DEFAULT_DOMAIN),
-    perRequestAtomic: args['per-request-atomic']
-      ? String(args['per-request-atomic'])
-      : usdcToAtomicString(args['per-request-usdc'] ?? '0.30'),
-    dailyAtomic: args['daily-atomic']
-      ? String(args['daily-atomic'])
-      : usdcToAtomicString(args['daily-usdc'] ?? '1'),
-    rpcUrl: String(args['rpc-url'] ?? process.env.X402_SOLANA_RPC_URL ?? DEFAULT_RPC_URL),
-    payTo: String(args['pay-to'] ?? process.env.X402_SOLANA_PAY_TO ?? DEFAULT_PAY_TO),
-    usdcMint: String(args['usdc-mint'] ?? process.env.X402_SOLANA_USDC_MINT ?? DEFAULT_USDC_MINT),
-    network: args.network ?? process.env.ANCHORA_X402_NETWORK ?? process.env.X402_SOLANA_NETWORK,
-    simulateBeforeSign: args['no-simulate'] !== true,
-  });
+  const record = await createWalletRecord(walletOptionsFromArgs(args));
 
   return {
     ok: true,
@@ -1194,6 +1255,7 @@ async function main() {
 
   let result;
   if (command === 'create') result = await runCreate(args);
+  else if (command === 'ensure') result = await runEnsure(args);
   else if (command === 'create-in-memory') result = await runCreateInMemory(args);
   else if (command === 'info') result = await runInfo(args);
   else if (command === 'balance') result = await runBalance(args);

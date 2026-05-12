@@ -51,6 +51,14 @@ npm run catalog
 
 For a normal agent task such as "pay for the proof package" or "fetch this asset through x402", do not inspect the private Anchora app repo, Graphify files, migrations, source code, or unrelated docs. This helper repo plus the live `/catalog`, `/quote`, and signing-context endpoint are the supported interface.
 
+If this helper repo is already available locally, use it directly. Preferred reusable workspace for Codex-like agents:
+
+```text
+$HOME/.codex/anchora-x402-agent
+```
+
+Do not clone once into a temporary directory and then clone again into a stable directory. Pick the stable workspace first, run `git pull --ff-only` or a shallow fetch there, then continue.
+
 Fastest happy path after the wallet exists, is funded, and the user has authorized the local policy:
 
 ```bash
@@ -96,6 +104,14 @@ npm ci
 npm run catalog
 ```
 
+If you only need to create or reuse the local payment wallet, use the idempotent command:
+
+```bash
+npm run x402:wallet:ensure
+```
+
+It creates `default` when missing and reuses it when the existing wallet already matches the Anchora policy. It prints the public funding address without exposing the secret. Do not wrap it in custom shell code or use a variable named `status` in zsh.
+
 No Git available:
 
 ```bash
@@ -120,7 +136,7 @@ npx -y @solana/pay --verbose curl https://anchora.markets/api/x402/v1/assets/2eZ
 Create a dedicated wallet:
 
 ```bash
-npm run x402:wallet -- create --wallet default --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
+npm run x402:wallet:ensure
 ```
 
 If the current workspace is read-only, create the wallet in a writable temp directory and reuse that directory on later wallet commands:
