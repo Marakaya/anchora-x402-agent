@@ -6,6 +6,30 @@ This repository is intentionally public and minimal. It contains only the agent 
 
 Use this repository as the canonical command workspace for agent-side x402 testing. Agents and judges do not need access to the private Anchora app repository.
 
+## Wallet Public Key Only Fast Path
+
+If the current task is only to create or show an Anchora x402 wallet public key, do not read beyond this section. Do not run catalog/quote, do not inspect any Anchora project repo, and do not run both wallet reuse and wallet creation.
+
+Use exactly one wallet command:
+
+- If the user did not explicitly ask for a fresh isolated wallet, reuse/create `default`:
+
+```bash
+cd "$HOME/.codex/anchora-x402-agent" 2>/dev/null \
+  && node -p "require('./package.json').version" \
+  && (test -d node_modules/@solana/kit || npm ci) \
+  && npm --silent run x402:wallet:ensure
+```
+
+- If the user explicitly asks for a fresh/new/isolated wallet, skip `ensure` and create one fresh wallet directly:
+
+```bash
+cd "$HOME/.codex/anchora-x402-agent" \
+  && npm --silent run x402:wallet -- create --wallet "fresh-$(date +%Y%m%d%H%M%S)" --domain anchora.markets --per-request-usdc 0.30 --daily-usdc 1
+```
+
+An existing `default` wallet with `spentToday: 0.3 USDC` and `dailyCap: 1 USDC` still has enough capacity for another `0.30 USDC` proof-package call; do not create a second wallet unless the user requested it. Return only the public funding address and no secret fields.
+
 ## Version Guard
 
 Before executing payments, use helper version `0.4.5` or newer:
