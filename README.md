@@ -51,6 +51,19 @@ npm run catalog
 
 For a normal agent task such as "pay for the proof package" or "fetch this asset through x402", do not inspect the private Anchora app repo, Graphify files, migrations, source code, or unrelated docs. This helper repo plus the live `/catalog`, `/quote`, and signing-context endpoint are the supported interface.
 
+Fastest happy path after the wallet exists, is funded, and the user has authorized the local policy:
+
+```bash
+npm run x402:proof -- \
+  --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX \
+  --agent-wallet default \
+  --execute-payment \
+  --print-body \
+  --json
+```
+
+The proof command performs catalog discovery, quote validation, payment signing, settlement, and redeem in one run. Do not split it into separate catalog and dry-run commands unless the user asked for an audit log, the wallet policy has not been authorized, or the command fails.
+
 Allowed discovery before payment:
 
 - `node -p "require('./package.json').version"`
@@ -183,6 +196,17 @@ npm run x402:wallet -- balance --wallet default
 ```
 
 Preferred single-call payment command after the user has authorized the local policy:
+
+```bash
+npm run x402:proof -- \
+  --asset-address 2eZLs5ZK1X7nvi835xbDxhGtUCvssV5s8WDUJF28gKvX \
+  --agent-wallet default \
+  --execute-payment \
+  --print-body \
+  --json
+```
+
+Equivalent fallback if your helper copy does not have the `x402:proof` script:
 
 ```bash
 npm run x402:agent -- \
